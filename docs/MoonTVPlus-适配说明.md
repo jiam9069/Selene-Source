@@ -244,6 +244,62 @@ data: [DONE]
 另外，若模型调用了工具却没有输出任何正文，兜底提示会说明
 「AI 已完成 N 次工具调用，但没有返回文字回答」，而不是留一个空气泡。
 
+#### 2.8.2 富展示与 history 回喂（1.6.12）
+
+2.8.1 让「正在做什么」看得见，2.8.2 让「查到了什么」留下来 —— 流式结束后，
+本条消息会固化两样东西并随下一次请求回喂服务端：
+
+| 固化内容 | 字段 | 作用 |
+|---|---|---|
+| 执行完的工具调用 | `toolCalls`（`name`/`args`/`key`/`result`/`ok`） | 服务端据此重建 `assistant(tool_calls) → tool → assistant` 转录，模型直接复用此前数据，不必在同一会话里重复调用工具 |
+| 早期对话的压缩摘要 | `compressedSummaries` | 协议里的 `{"type":"context_compressed","summary":"…"}`；服务端优先按摘要重建上下文，避免上下文再次膨胀 |
+
+请求体形如：
+
+```json
+{"message":"…","history":[{"role":"assistant","content":"…",
+  "toolCalls":[{"name":"douban_lookup","args":{"query":"流浪地球"},
+                "key":"流浪地球","result":"…","ok":true}],
+  "compressedSummaries":["【较早对话已压缩】…"]}]}
+```
+
+兼容性上做了两件事，保证旧服务端不受影响：
+
+- `AiToolCall.toHistoryJson()` **只**输出 `name/args/key/result/ok`，
+  界面用的 `status` 不进 history（服务端不认这个字段）；
+- `AiChatMessage.toHistoryJson()` 在没有工具与摘要时**严格只输出**
+  `role`/`content` 两个键（有才追加另两个），旧服务端不会收到多余字段。
+
+#### 2.8.3 影片源直出：回答完直接给可点播的源（1.6.12）
+
+用户在 AI 问片里问「有没有 X 的资源」，旧流程要等模型给完文字、再手动去搜索页
+搜一次才能看。现在回复一结束就自动搜同名可播放源，以卡片摆到回答下面，点一下
+直接进播放器。
+
+流程（纯客户端，不改服务端）：
+
+1. **片名提取** `extractPlayableSourceQuery`，按优先级：
+   1. 标题类工具参数：`douban_lookup` / `tmdb_lookup` / `search_videos` /
+      `search` 的 `args.query`；
+   2. 回复里的 `《片名》`（≤40 字），其次 `「片名」`；
+   3. `web_search` 的 `args.query` 且 ≤20 字（更长的是长句，不是片名）。
+
+   都取不到 → 不自动搜，在回答下挂「搜影片源」入口，点击后拿**上一条用户
+   消息**去搜。
+2. **搜索**：复用聚合搜索的 `SSESearchService`（`GET /api/search/ws?q=…`），
+   `startSearch` 先校验登录态与服务器地址，再挂增量结果 / 进度 / 错误三条流。
+   15 秒超时由 `complete` 事件、`stopSearch()` 或页面 dispose 取消。
+3. **卡片**：按 `source|id` 去重，**封顶 12 张**，拿满即提前收线；卡片显示
+   `年份 · 源名 · 共N集`，海报缺失时用占位图标（离线/测试环境不发网络请求）。
+   点卡片进 `PlayerScreen(source, id, year, title, stitle:, stype:)`，
+   参数与搜索页完全一致。
+4. **状态**：进行中显示「正在搜索影片源… 当前源（x/y）」；一旦有卡片就先渲染
+   卡片、下面再跟一行「继续搜索中…」（结果是一条条流回来的，不干等整个搜索）；
+   0 条显示「暂时没搜到可播放源」；出错或超时显示「影片源搜索未成功」，
+   两者都给「换词重搜」（弹输入框改词重搜）。
+5. **history 隔离**：搜索状态与卡片只挂在 `AiChatMessage` 的展示字段上，
+   `toHistoryJson()` 不含它们，回喂服务端的 history 完全不受影响。
+
 ### 2.9 新增：私人影库浏览入口
 
 MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`，标题
@@ -288,16 +344,16 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 |---|---|
 | `lib/models/server_config.dart` | `/api/server-config` 模型与后端类型识别（MoonTVPlus vs v100） |
 | `lib/models/web_live_source.dart` | 网络直播源与直播流模型 |
-| `lib/models/ai_message.dart` | AI 对话消息与 SSE 事件模型 |
+| `lib/models/ai_message.dart` | AI 对话消息与 SSE 事件模型（含工具链、压缩摘要、影片源展示字段） |
 | `lib/services/backend_service.dart` | 后端能力探测 + access token 自动续期 |
 | `lib/services/web_live_service.dart` | 网络直播源获取与流地址解析 |
 | `lib/services/ai_service.dart` | AI 问片 SSE 流式客户端 |
-| `lib/screens/ai_chat_screen.dart` | AI 问片聊天界面 |
+| `lib/screens/ai_chat_screen.dart` | AI 问片聊天界面（工具链富展示、history 回喂、影片源直出） |
 | `lib/models/emby_models.dart` | 私人影库模型（源 / 分类 / 条目）与分页规则 |
 | `lib/services/emby_service.dart` | 私人影库三级接口客户端 |
 | `lib/screens/private_library_screen.dart` | 私人影库浏览页（源 → 分类 → 条目 → 播放） |
 | `test/moontvplus_compat_test.dart` | 适配层回归测试（夹具取自真实响应） |
-| `test/ai_chat_stream_test.dart` | AI 问片流式渲染回归测试 |
+| `test/ai_chat_stream_test.dart` | AI 问片流式渲染 + 影片源直出回归测试 |
 | `test/emby_private_library_test.dart` | 私人影库模型与分页单元测试 |
 | `test/private_library_screen_test.dart` | 私人影库页面渲染测试 |
 | `test/bottom_nav_test.dart` | 底栏 7 项窄屏不溢出回归测试 |
@@ -324,14 +380,19 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 
 ## 4. 验证方式
 
-1. **静态分析**：`flutter analyze` 无 error、无 warning。
+1. **静态分析**：`dart analyze` 无 error、无 warning。
    与上游同一 commit 的基线对比，未引入任何新的 lint 类别。
+   ⚠️ **必须用 `dart analyze`，不要用 `flutter analyze`**：后者走 LSP，在含中文的
+   路径（如 `/root/DSH/应用/…`）下会直接崩溃（exit 255）。另外 `dart` 不在默认
+   PATH 上，先 `export PATH="/root/DSH/tools/flutter/bin:$PATH"`。
 2. **回归测试**：`flutter test`（全部用例），夹具直接取自真实
    MoonTVPlus 响应（server-config、搜索事件、AI SSE、网络直播源、
    Emby 三级接口）。含：
    - `test/moontvplus_compat_test.dart`：适配层协议解析
    - `test/ai_chat_stream_test.dart`：用真实 SSE 事件序列驱动真实
-     `AiChatScreen`，断言工具名映射、进度反馈与正文渲染
+     `AiChatScreen`，断言工具名映射、进度反馈、正文渲染、history 回喂结构，
+     以及影片源直出（片名提取单测 + 自动搜并点播、手动入口与零结果、
+     解析失败、12 张上限；`/api/search/ws` 用可控 SSE 响应驱动）
    - `test/emby_private_library_test.dart`：私人影库模型与分页规则
    - `test/private_library_screen_test.dart`：用真实形状响应驱动真实
      `PrivateLibraryScreen`，断言标题 / 源选择 / 分类 / 条目 / 徽标
@@ -340,10 +401,25 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
    `/api/server-config`、`/api/emby/{sources,views,list,detail}`、
    `/api/detail`（对照 400）、`/api/auth/refresh`、
    `/api/web-live/{sources,stream,proxy}`、
-   `/api/search/resources`、`/api/ai/chat` 的实际响应。
+   `/api/search/resources`、`/api/search/ws`、`/api/ai/chat` 的实际响应。
 4. **端到端**：`MOONTVPLUS_E2E=1 MOONTVPLUS_BASE_URL=... MOONTVPLUS_COOKIE=... flutter test test/moontvplus_e2e_test.dart`
    —— 默认跳过，需要在能访问真实后端的机器上显式开启，
    会实际调用 Emby 详情、私人影库三级链路、网络直播解析与 AI 流式对话。
+
+写 widget 测试时本项目踩过的三个坑（都已在 `test/ai_chat_stream_test.dart`
+里规避，改测试时注意别改回去）：
+
+- 伪造 HTTP 响应用的是**单订阅** `StreamController`，`await close()` 要等唯一
+  订阅者消费完 done 才返回。对**从未被监听**的响应（例如用例没触发影片源搜索、
+  `setUp` 里预建的那个实例）调 `await close()` 会永久挂起，表现为整个套件
+  第一个用例卡死不退出。因此关闭一律 fire-and-forget。
+- `SSESearchService` 有 15 秒超时 `Timer`。widget 测试里页面 `dispose()` 的异步
+  清理赶不上测试结束，会触发 `'!timersPending'`。收尾要先让服务端补发
+  `{"type":"complete"}` 走同步路径撤掉定时器，再 `pumpWidget(SizedBox())`；
+  注意**搜索失败路径不会自动断流**，同样要补 `complete`。
+- `PlayerScreen` 依赖 media_kit（本机没装 `libmpv`），在单测里构建不出来。
+  `AiChatScreen.sourceResultNavigatorOverride` 是为此留的测试接缝，注入一个
+  只记参数的回调来断言跳转参数。
 
 ---
 
@@ -351,7 +427,11 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 
 - Emby 源在**本地搜索模式**下不可用（该模式下客户端直连采集接口，
   无法访问 MoonTVPlus 的 Emby 私有接口）。请使用服务器搜索模式。
-- AI 问片的「工具调用状态」目前以状态提示呈现；
-  MoonTVPlus 新协议模式（`EnableNewMode`）下的工具结果富展示未做适配。
+- AI 问片已适配新协议（`EnableNewMode`）的工具链富展示与 history 回喂
+  （见 2.8.2）。影片源直出依赖**片名提取启发式**：回复里没带片名、也没查到片名
+  参数时，会退化为手动「搜影片源」入口 —— 属预期行为而非缺陷（宁可让人点一下，
+  也不拿一整句问话去搜出一堆无关结果）。
+- 影片源直出卡片封顶 12 张、单轮 15 秒超时；只展示聚合搜索能返回的源，
+  不做二次分页或按源筛选。
 - 超分（Anime4K）、弹幕、观影室、追番订阅、网盘、书籍、漫画、音乐等
   MoonTVPlus 专有功能本次未纳入适配范围。
