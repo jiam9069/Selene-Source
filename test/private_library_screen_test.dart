@@ -285,4 +285,66 @@ void main() {
         reason: '未配置时应给出明确说明而不是空白页：\n$text');
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('作为独立路由推入（canPop=true）时也能正常渲染', (tester) async {
+    // 该分支与底栏标签页分支的外壳不同（是否自带背景与安全区），需分别覆盖
+    tester.view.physicalSize = const Size(1080, 2280);
+    tester.view.devicePixelRatio = 3.0;
+    addTearDown(tester.view.reset);
+
+    HttpOverrides.global = _FakeOverrides((url) async {
+      final path = url.path;
+      if (path.contains('/api/emby/sources')) {
+        return _JsonResponse(200, json.encode(_sources));
+      }
+      if (path.contains('/api/emby/views')) {
+        return _JsonResponse(200, json.encode(_views));
+      }
+      if (path.contains('/api/emby/list')) {
+        return _JsonResponse(200, json.encode(_list));
+      }
+      return _JsonResponse(
+        200,
+        json.encode({
+          'SiteName': 'MoonTVPlus',
+          'Version': '226.1.0',
+          'AIEnabled': true,
+        }),
+      );
+    });
+    addTearDown(() => HttpOverrides.global = null);
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<ThemeService>.value(
+        value: ThemeService(),
+        child: MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const PrivateLibraryScreen(),
+                    ),
+                  ),
+                  child: const Text('打开'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.text('打开'));
+    for (var i = 0; i < 30; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    final text = _visibleText(tester);
+    expect(text, contains('私人影库'), reason: '独立路由模式渲染失败：\n$text');
+    expect(text, contains('《电诈 摇滚 吴哥窟》'),
+        reason: '独立路由模式条目未渲染：\n$text');
+    expect(tester.takeException(), isNull);
+  });
 }

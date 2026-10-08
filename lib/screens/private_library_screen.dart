@@ -271,11 +271,22 @@ class _PrivateLibraryScreenState extends State<PrivateLibraryScreen> {
     return Consumer<ThemeService>(
       builder: (context, themeService, child) {
         final isDark = themeService.isDarkMode;
+        // 两种使用方式需要不同的外壳：
+        // - 作为底栏标签页嵌在 MainLayout 中（canPop 为 false）：外层已经处理
+        //   状态栏与底部安全区，并提供浅色渐变背景。同级页面（电影 / 剧集 /
+        //   动漫 / 综艺 / 直播）都没有 Scaffold 和 SafeArea，这里若保留就会
+        //   多出一段顶部留白，并盖掉外层渐变。
+        // - 从用户菜单作为独立路由推入（canPop 为 true）：没有外层承载，
+        //   需要自己的背景与安全区。
+        final isStandalone = Navigator.of(context).canPop();
 
         return Theme(
           data: isDark ? themeService.darkTheme : themeService.lightTheme,
           child: Scaffold(
+            backgroundColor: isStandalone ? null : Colors.transparent,
             body: SafeArea(
+              top: isStandalone,
+              bottom: isStandalone,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
