@@ -28,7 +28,8 @@ MoonTVPlus 实例（`v226.1.0`，Kvrocks 存储，70 个采集源 + 3 个 Emby �
 | 相对播放地址 | 无 | 私人影库返回 `/api/openlist/play?...` 等站内相对地址 | 播放器拿到相对地址无法播放 | 统一补全为绝对地址 |
 | `/api/search/resources` | 仅采集源 | 采集源 + 源脚本条目 `{key,name,script:true}`（**无 `api` 字段**） | 本地搜索拿空 URL 去请求，空等超时 | 过滤掉无 `api` 的条目 |
 | 网络直播（WebLive） | 无 | `/api/web-live/sources`、`/api/web-live/stream` | 无任何入口 | 新增模型 / 服务 / UI，并入直播列表 |
-| AI 问片 | 无 | `POST /api/ai/chat`（SSE 流式） | 无任何入口 | 新增聊天界面与服务 |
+| AI 问片 | 无 | `POST /api/ai/chat`（SSE 流式） | 无任何入口 | 新增聊天界面与服务（见 2.8、2.8.1） |
+| 私人影库页面 | 无 | `/private-library`，另有 `/api/emby/{sources,views,list}` | 无任何入口，只能靠聚合搜索偶然命中 | 新增浏览页并加入底栏与用户菜单（见 2.9） |
 
 ---
 
@@ -220,6 +221,63 @@ data: [DONE]
 `lib/screens/ai_chat_screen.dart`；入口在用户菜单，且仅在
 `/api/server-config` 返回 `AIEnabled: true` 时显示。
 
+#### 2.8.1 实测修正：工具名映射与进度反馈
+
+首版上线后用户反馈「提示已完成，但没看到任何信息」。实测后端 SSE 本身正常
+（一条回答实验为 200+ 个 `{"text":"..."}` 事件、正文从第 1 个事件就开始下发），
+问题在客户端渲染层，共三处：
+
+1. **工具名映射不完整**（「已完成」的来源）。实测真实工具名是
+   `douban_lookup`、`web_search`、`fetch_page`、`tmdb_lookup`、
+   `get_user_favorites`、`get_user_recent`、`get_current_time`、`glob`、`bash`，
+   而旧代码只映射了 `search_videos` / `get_video_detail` / `get_hot_movies` /
+   `get_recommendations` 这 4 个**并不存在**的名字，导致所有真实工具都落到
+   `default` 分支，界面上反复显示没有信息量的「已完成」。现已按真实工具名
+   补全映射，未知工具也会保留原名（如「已完成 douban_lookup」）以便排查。
+2. **等待期间没有反馈**。模型思考 + 连续调用工具可能持续 20~90 秒，
+   期间界面只有一行静态提示，看起来和卡死无异。现在流式期间**始终**显示
+   进度行：当前步骤 + `已等待 N 秒` + 最近完成的步骤列表。
+3. **高频重绘**。一条回答会触发 200+ 次 `setState`，每次都对整段内容全量
+   重解析 Markdown。现改为 100ms 合并增量重绘，且流式输出中的尾部消息用
+   纯文本渲染，收到 `[DONE]` 后再切回 Markdown。
+
+另外，若模型调用了工具却没有输出任何正文，兜底提示会说明
+「AI 已完成 N 次工具调用，但没有返回文字回答」，而不是留一个空气泡。
+
+### 2.9 新增：私人影库浏览入口
+
+MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`，标题
+「私人影库」，副标题「观看自我收藏的高清视频吧」），客户端此前**完全没有**
+对应入口 —— Emby 源只能在聚合搜索里偶然搜到时才打得开。
+
+接口契约（三者都需要登录 Cookie）：
+
+| 接口 | 返回 |
+|---|---|
+| `GET /api/emby/sources` | `{"sources":[{"key":"net","name":"Hohai公益Emby"}, …]}` |
+| `GET /api/emby/views?source=<key>` | `{"success":true,"views":[{"id","name","type"}]}` |
+| `GET /api/emby/list?source=<key>&viewId=<id>&page=<n>` | `{"success":true,"list":[{id,title,poster,year,rating,mediaType}]}` |
+
+要点：
+
+- 每页固定 20 条，且响应**没有** total / pageCount 字段，因此只能用
+  「本页不足 20 条即为末页」来终止分页。
+- `mediaType` 为 `movie` / `tv`，界面上分别显示「电影」/「剧集」徽标；
+  `rating` 可能为 `0`（视为无评分，不显示），也可能为小数，两种都要能解析。
+- 海报虽通常已是绝对地址，仍统一过一遍 `ApiService.absolutize`。
+- 播放复用既有链路：`PlayerScreen(source: 'emby_<key>', id: <itemId>)`
+  （见 2.3，`emby_*` 源会被路由到 `/api/emby/detail`）。
+
+入口有两个，且都只在后端**真的配置了** Emby 源时出现（探测
+`/api/emby/sources` 非空）：
+
+- 主界面底栏「影库」（第 7 项，索引 6）
+- 用户菜单「私人影库」
+
+底栏由 6 项变 7 项后，在 320px 窄屏手机上会 RenderFlex 溢出 20px，
+因此手机端底栏改为横向滚动容器：放得下时靠 `minWidth` 撑满并保持
+`spaceEvenly` 均分（视觉与改动前一致），放不下时可滚动而不是报错。
+
 ---
 
 ## 3. 新增与改动的文件
@@ -235,7 +293,14 @@ data: [DONE]
 | `lib/services/web_live_service.dart` | 网络直播源获取与流地址解析 |
 | `lib/services/ai_service.dart` | AI 问片 SSE 流式客户端 |
 | `lib/screens/ai_chat_screen.dart` | AI 问片聊天界面 |
+| `lib/models/emby_models.dart` | 私人影库模型（源 / 分类 / 条目）与分页规则 |
+| `lib/services/emby_service.dart` | 私人影库三级接口客户端 |
+| `lib/screens/private_library_screen.dart` | 私人影库浏览页（源 → 分类 → 条目 → 播放） |
 | `test/moontvplus_compat_test.dart` | 适配层回归测试（夹具取自真实响应） |
+| `test/ai_chat_stream_test.dart` | AI 问片流式渲染回归测试 |
+| `test/emby_private_library_test.dart` | 私人影库模型与分页单元测试 |
+| `test/private_library_screen_test.dart` | 私人影库页面渲染测试 |
+| `test/bottom_nav_test.dart` | 底栏 7 项窄屏不溢出回归测试 |
 
 改动：
 
@@ -250,7 +315,9 @@ data: [DONE]
 | `lib/services/search_service.dart`、`lib/services/sse_search_service.dart` | 本地搜索过滤改用 `isSearchable` |
 | `lib/screens/player_screen.dart` | 空剧集回源拉详情；播放地址补全与 `proxyMode` 包装 |
 | `lib/screens/live_player_screen.dart` | 透传频道级请求头 |
-| `lib/widgets/user_menu.dart` | AI 问片入口（按后端能力显示） |
+| `lib/widgets/user_menu.dart` | AI 问片入口 + 私人影库入口（均按后端能力显示） |
+| `lib/screens/home_screen.dart` | 探测 Emby 可用性，决定是否加入「影库」页与底栏项 |
+| `lib/widgets/main_layout.dart` | 新增可选的「影库」底栏项；手机端底栏改为可横向滚动 |
 | `lib/services/version_service.dart` | 更新检查指向本 fork 的 Release |
 
 ---
@@ -259,15 +326,24 @@ data: [DONE]
 
 1. **静态分析**：`flutter analyze` 无 error、无 warning。
    与上游同一 commit 的基线对比，未引入任何新的 lint 类别。
-2. **回归测试**：`flutter test test/moontvplus_compat_test.dart`，
-   夹具直接取自真实 MoonTVPlus 响应（server-config、搜索事件、AI SSE、网络直播源）。
+2. **回归测试**：`flutter test`（全部用例），夹具直接取自真实
+   MoonTVPlus 响应（server-config、搜索事件、AI SSE、网络直播源、
+   Emby 三级接口）。含：
+   - `test/moontvplus_compat_test.dart`：适配层协议解析
+   - `test/ai_chat_stream_test.dart`：用真实 SSE 事件序列驱动真实
+     `AiChatScreen`，断言工具名映射、进度反馈与正文渲染
+   - `test/emby_private_library_test.dart`：私人影库模型与分页规则
+   - `test/private_library_screen_test.dart`：用真实形状响应驱动真实
+     `PrivateLibraryScreen`，断言标题 / 源选择 / 分类 / 条目 / 徽标
+   - `test/bottom_nav_test.dart`：320px 窄屏下 7 项底栏不溢出
 3. **接口层实测**：在真实实例上逐一核对
-   `/api/server-config`、`/api/emby/detail`、`/api/detail`（对照 400）、
-   `/api/auth/refresh`、`/api/web-live/{sources,stream,proxy}`、
+   `/api/server-config`、`/api/emby/{sources,views,list,detail}`、
+   `/api/detail`（对照 400）、`/api/auth/refresh`、
+   `/api/web-live/{sources,stream,proxy}`、
    `/api/search/resources`、`/api/ai/chat` 的实际响应。
 4. **端到端**：`MOONTVPLUS_E2E=1 MOONTVPLUS_BASE_URL=... MOONTVPLUS_COOKIE=... flutter test test/moontvplus_e2e_test.dart`
    —— 默认跳过，需要在能访问真实后端的机器上显式开启，
-   会实际调用 Emby 详情、网络直播解析与 AI 流式对话。
+   会实际调用 Emby 详情、私人影库三级链路、网络直播解析与 AI 流式对话。
 
 ---
 

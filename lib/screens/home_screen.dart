@@ -25,6 +25,8 @@ import 'anime_screen.dart';
 import 'show_screen.dart';
 import 'player_screen.dart';
 import 'live_screen.dart';
+import 'private_library_screen.dart';
+import '../services/emby_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -39,6 +41,10 @@ class _HomeScreenState extends State<HomeScreen> {
   late PageController _pageController;
   late PageController _bottomNavPageController;
 
+  /// 后端是否配置了私人影库（MoonTVPlus 的 Emby 源）。
+  /// 只有真的配了才显示底栏「影库」入口，避免给出一个必然空白的页面。
+  bool _embyEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -50,6 +56,17 @@ class _HomeScreenState extends State<HomeScreen> {
     _refreshCacheOnHomeEnter();
     // 检查应用更新
     _checkForUpdates();
+    // 探测私人影库是否可用（决定底栏是否出现「影库」）
+    _checkEmbyAvailability();
+  }
+
+  /// 探测私人影库入口是否应该出现
+  Future<void> _checkEmbyAvailability() async {
+    final available = await EmbyService.isAvailable();
+    if (!mounted || _embyEnabled == available) return;
+    setState(() {
+      _embyEnabled = available;
+    });
   }
 
   /// 检查应用更新
@@ -397,6 +414,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onTopTabChanged: _onTopTabChanged,
       onHomeTap: _onHomeTap,
       onSearchTap: _onSearchTap,
+      showLibraryNav: _embyEnabled,
     );
   }
 
@@ -419,6 +437,9 @@ class _HomeScreenState extends State<HomeScreen> {
         const AnimeScreen(),
         const ShowScreen(),
         const LiveScreen(),
+        // 私人影库（索引 6）—— 与底栏「影库」一一对应，
+        // 未配置 Emby 时该项和底栏按钮一起消失，索引不会错位。
+        if (_embyEnabled) const PrivateLibraryScreen(),
       ],
     );
   }

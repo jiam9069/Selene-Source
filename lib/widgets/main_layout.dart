@@ -29,6 +29,10 @@ class MainLayout extends StatefulWidget {
   final VoidCallback? onClearSearch;
   final bool showBottomNav;
 
+  /// 是否显示底栏「影库」（私人影库）入口。
+  /// 只有后端配置了 Emby 源时才为 true，且必须与 content 的页数一一对应。
+  final bool showLibraryNav;
+
   const MainLayout({
     super.key,
     required this.content,
@@ -46,6 +50,7 @@ class MainLayout extends StatefulWidget {
     this.onSearchSubmitted,
     this.onClearSearch,
     this.showBottomNav = true,
+    this.showLibraryNav = false,
   });
 
   @override
@@ -890,6 +895,9 @@ class _MainLayoutState extends State<MainLayout> {
       {'icon': LucideIcons.cat, 'label': '动漫'},
       {'icon': LucideIcons.clover, 'label': '综艺'},
       {'icon': LucideIcons.radio, 'label': '直播'},
+      // 私人影库（索引 6），只有后端配置了 Emby 源才出现
+      if (widget.showLibraryNav)
+        {'icon': LucideIcons.libraryBig, 'label': '影库'},
     ];
 
     final isTablet = DeviceUtils.isTablet(context);
@@ -914,94 +922,122 @@ class _MainLayoutState extends State<MainLayout> {
         top: 8,
         bottom: MediaQuery.of(context).padding.bottom + 8, // 手动处理底部安全区域
       ),
-      child: Row(
-        mainAxisAlignment:
-            isTablet ? MainAxisAlignment.center : MainAxisAlignment.spaceEvenly,
-        children: [
-          // 平板模式下添加左侧空白
-          if (isTablet) const Spacer(flex: 3),
+      child: _buildBottomNavRow(navItems, themeService, isTablet),
+    );
+  }
 
-          // 导航按钮
-          ...navItems.asMap().entries.expand((entry) {
-            int index = entry.key;
-            Map<String, dynamic> item = entry.value;
-            bool isSelected =
-                !widget.isSearchMode && widget.currentBottomNavIndex == index;
-            bool isHovered = DeviceUtils.isPC() && _hoveredNavIndex == index;
+  /// 构建底部导航行
+  ///
+  /// 手机端窄屏（如 320px）放 7 个入口时会溢出，因此分两种布局：
+  /// - 平板：保持原有的居中 + 固定间距（宽度充足，不会溢出）
+  /// - 手机：放进横向滚动容器。放得下时靠 `minWidth` 撑满可用宽度并保持
+  ///   `spaceEvenly` 均分（视觉与改动前一致）；放不下时可横向滚动，
+  ///   而不是抛出 RenderFlex overflow。
+  Widget _buildBottomNavRow(
+    List<Map<String, dynamic>> navItems,
+    ThemeService themeService,
+    bool isTablet,
+  ) {
+    // 导航按钮
+    final buttons = navItems.asMap().entries.expand((entry) {
+      int index = entry.key;
+      Map<String, dynamic> item = entry.value;
+      bool isSelected =
+          !widget.isSearchMode && widget.currentBottomNavIndex == index;
+      bool isHovered = DeviceUtils.isPC() && _hoveredNavIndex == index;
 
-            return [
-              MouseRegion(
-                cursor: DeviceUtils.isPC()
-                    ? SystemMouseCursors.click
-                    : MouseCursor.defer,
-                onEnter: DeviceUtils.isPC()
-                    ? (_) {
-                        setState(() {
-                          _hoveredNavIndex = index;
-                        });
-                      }
-                    : null,
-                onExit: DeviceUtils.isPC()
-                    ? (_) {
-                        setState(() {
-                          _hoveredNavIndex = null;
-                        });
-                      }
-                    : null,
-                child: GestureDetector(
-                  onTap: () {
-                    widget.onBottomNavChanged(index);
-                  },
-                  behavior: HitTestBehavior.opaque, // 确保整个区域都可以点击
-                  child: Container(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: isTablet ? 16 : 12,
-                      vertical: 8,
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          item['icon'],
-                          color: isSelected
-                              ? const Color(0xFF27ae60)
-                              : isHovered
-                                  ? const Color(0xFF52c77a) // hover 时的浅绿色
-                                  : themeService.isDarkMode
-                                      ? const Color(0xFFb0b0b0)
-                                      : const Color(0xFF7f8c8d),
-                          size: 24,
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          item['label'],
-                          style: FontUtils.poppins(
-                            fontSize: 12,
-                            fontWeight:
-                                isSelected ? FontWeight.w600 : FontWeight.w400,
-                            color: isSelected
-                                ? const Color(0xFF27ae60)
-                                : isHovered
-                                    ? const Color(0xFF52c77a) // hover 时的浅绿色
-                                    : themeService.isDarkMode
-                                        ? const Color(0xFFb0b0b0)
-                                        : const Color(0xFF7f8c8d),
-                          ),
-                        ),
-                      ],
+      return [
+        MouseRegion(
+          cursor:
+              DeviceUtils.isPC() ? SystemMouseCursors.click : MouseCursor.defer,
+          onEnter: DeviceUtils.isPC()
+              ? (_) {
+                  setState(() {
+                    _hoveredNavIndex = index;
+                  });
+                }
+              : null,
+          onExit: DeviceUtils.isPC()
+              ? (_) {
+                  setState(() {
+                    _hoveredNavIndex = null;
+                  });
+                }
+              : null,
+          child: GestureDetector(
+            onTap: () {
+              widget.onBottomNavChanged(index);
+            },
+            behavior: HitTestBehavior.opaque, // 确保整个区域都可以点击
+            child: Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: isTablet ? 16 : 12,
+                vertical: 8,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    item['icon'],
+                    color: isSelected
+                        ? const Color(0xFF27ae60)
+                        : isHovered
+                            ? const Color(0xFF52c77a) // hover 时的浅绿色
+                            : themeService.isDarkMode
+                                ? const Color(0xFFb0b0b0)
+                                : const Color(0xFF7f8c8d),
+                    size: 24,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    item['label'],
+                    style: FontUtils.poppins(
+                      fontSize: 12,
+                      fontWeight:
+                          isSelected ? FontWeight.w600 : FontWeight.w400,
+                      color: isSelected
+                          ? const Color(0xFF27ae60)
+                          : isHovered
+                              ? const Color(0xFF52c77a) // hover 时的浅绿色
+                              : themeService.isDarkMode
+                                  ? const Color(0xFFb0b0b0)
+                                  : const Color(0xFF7f8c8d),
                     ),
                   ),
-                ),
+                ],
               ),
-              // 平板模式下在按钮之间添加间距
-              if (isTablet && index < navItems.length - 1)
-                const SizedBox(width: 36),
-            ];
-          }),
+            ),
+          ),
+        ),
+        // 平板模式下在按钮之间添加间距
+        if (isTablet && index < navItems.length - 1) const SizedBox(width: 36),
+      ];
+    }).toList();
 
+    if (isTablet) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          // 平板模式下添加左侧空白
+          const Spacer(flex: 3),
+          ...buttons,
           // 平板模式下添加右侧空白
-          if (isTablet) const Spacer(flex: 3),
+          const Spacer(flex: 3),
         ],
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minWidth: constraints.maxWidth),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: buttons,
+          ),
+        ),
       ),
     );
   }

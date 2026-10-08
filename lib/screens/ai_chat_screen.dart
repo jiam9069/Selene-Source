@@ -45,11 +45,26 @@ class _AiChatScreenState extends State<AiChatScreen> {
   /// 是否正在接收回复
   bool _isStreaming = false;
 
-  /// 工具调用提示文案（如「正在搜索影片…」），null 表示不显示
+  /// 工具调用提示文案（如「正在查询豆瓣…」），null 表示当前没有工具在跑
   String? _toolStatus;
 
-  /// 工具是否仍在执行（决定提示行显示加载动画还是完成图标）
-  bool _toolRunning = false;
+  /// 已经完成的工具步骤（如「已查询豆瓣」），让用户看到 AI 确实在干活。
+  /// 只保留最近若干条，避免长时间对话把提示区撑爆。
+  final List<String> _steps = [];
+
+  /// 本次回复已经等待的秒数（流式期间每秒刷新）
+  int _elapsedSeconds = 0;
+
+  /// 每次工具完成的累计次数，用于「无正文」时的兜底说明
+  int _toolCallCount = 0;
+
+  /// 正文增量合并计时器：把高频 SSE 事件合并成低频重绘，
+  /// 否则一条回答会触发 200+ 次 setState + Markdown 全量重解析，
+  /// 在手机上足以让界面看起来「卡住不显示」。
+  Timer? _flushTimer;
+
+  /// 秒表计时器
+  Timer? _tickTimer;
 
   /// 是否正在检查后端是否开启 AI
   bool _checkingAvailability = true;
@@ -67,6 +82,10 @@ class _AiChatScreenState extends State<AiChatScreen> {
     // 离开页面时取消订阅，后续事件不会再触发 setState
     _subscription?.cancel();
     _subscription = null;
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _tickTimer?.cancel();
+    _tickTimer = null;
     _inputController.dispose();
     _inputFocusNode.dispose();
     _scrollController.dispose();
@@ -123,8 +142,11 @@ class _AiChatScreenState extends State<AiChatScreen> {
       _messages.add(AiChatMessage(role: AiChatRole.assistant, content: ''));
       _isStreaming = true;
       _toolStatus = null;
-      _toolRunning = false;
+      _steps.clear();
+      _toolCallCount = 0;
+      _elapsedSeconds = 0;
     });
+    _startTimers();
     _scrollToBottom();
 
     // 上一路订阅理论上已经结束，这里再兜底取消一次
@@ -138,29 +160,64 @@ class _AiChatScreenState extends State<AiChatScreen> {
     );
   }
 
+  /// 启动「流式期间」的两个计时器：
+  /// - 秒表：每秒刷新等待时长，让用户知道程序没有卡死
+  /// - 正文合并器不需要在这里启动，由 [_scheduleFlush] 按需创建
+  void _startTimers() {
+    _tickTimer?.cancel();
+    _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_isStreaming) return;
+      setState(() {
+        _elapsedSeconds++;
+      });
+    });
+  }
+
+  /// 高频正文事件的重绘节流
+  ///
+  /// 后端会把一条回答拆成数百个 `{"text":"..."}` 事件（实测 200+ 个），
+  /// 每个都 setState 会让整棵消息列表 + Markdown 反复重解析。
+  /// 这里把 100ms 内的增量合并成一次重绘。
+  void _scheduleFlush() {
+    if (_flushTimer != null) return; // 本周期内已经安排过
+    _flushTimer = Timer(const Duration(milliseconds: 100), () {
+      _flushTimer = null;
+      if (!mounted) return;
+      setState(() {});
+      _scrollToBottom();
+    });
+  }
+
   /// 处理单个 SSE 事件
   void _onStreamEvent(AiStreamEvent event) {
     if (!mounted) return;
 
-    // 工具调用：显示为一条临时状态提示
+    // 工具调用：更新进度提示（不打断正文渲染）
     if (event.isTool) {
+      final label = _toolStatusText(event.toolName, event.toolStatus);
       setState(() {
-        _toolStatus = _toolStatusText(event.toolName, event.toolStatus);
-        _toolRunning = event.isToolRunning;
+        if (event.isToolRunning) {
+          _toolStatus = label;
+        } else {
+          _toolStatus = null;
+          _toolCallCount++;
+          if (label != null && !_steps.contains(label)) {
+            _steps.add(label);
+            // 只保留最近 4 条，超出丢弃最早的
+            if (_steps.length > 4) _steps.removeAt(0);
+          }
+        }
       });
       _scrollToBottom();
       return;
     }
 
-    // 增量正文：追加到当前助手消息，并清掉工具提示
+    // 增量正文：先落库再节流重绘，数据不会丢
     final text = event.text;
     if (text != null && text.isNotEmpty) {
-      setState(() {
-        _toolStatus = null;
-        _toolRunning = false;
-        _appendAssistantText(text);
-      });
-      _scrollToBottom();
+      _toolStatus = null;
+      _appendAssistantText(text);
+      _scheduleFlush();
     }
 
     if (event.done) {
@@ -181,17 +238,27 @@ class _AiChatScreenState extends State<AiChatScreen> {
   void _finishStreaming() {
     if (!mounted) return;
 
+    // 收尾时把还在等待的重绘立刻落地，避免丢掉最后一小段正文
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _tickTimer?.cancel();
+    _tickTimer = null;
+
     setState(() {
       _isStreaming = false;
       _toolStatus = null;
-      _toolRunning = false;
 
-      // 助手没有任何内容时给出兜底提示，避免留下空气泡
+      // 助手没有任何内容时给出兜底提示，避免留下空气泡。
+      // 分两种情况：AI 有调用工具但没输出正文（服务端问题），
+      // 和完全没有响应（网络/超时），提示要能区分才好排查。
       final last = _messages.isEmpty ? null : _messages.last;
       if (last != null &&
           last.role == AiChatRole.assistant &&
           last.content.trim().isEmpty) {
-        last.content = '（未收到回复，请稍后重试）';
+        last.content = _toolCallCount > 0
+            ? 'AI 已完成 $_toolCallCount 次工具调用，但没有返回文字回答。'
+                '可能是模型服务异常，请再试一次。'
+            : '（未收到回复，请稍后重试）';
       }
     });
 
@@ -217,21 +284,46 @@ class _AiChatScreenState extends State<AiChatScreen> {
   }
 
   /// 工具名 -> 中文提示
-  String _toolStatusText(String? name, String? status) {
+  ///
+  /// 工具名必须与后端 `/api/ai/chat` 实际下发的名称一致。实测 MoonTVPlus
+  /// 会用到：`douban_lookup`、`web_search`、`fetch_page`、`tmdb_lookup`、
+  /// `get_user_favorites`、`get_user_recent`、`get_current_time`、`glob`、`bash`
+  /// 等。之前只映射了 4 个并不存在的名字，导致所有真实工具都落到 default，
+  /// 界面上只剩一句没有信息量的「已完成」。
+  ///
+  /// 返回值：进行中返回「正在…」，已完成返回「已…」；[status] 为 done 时
+  /// 返回的是「完成态」文案，用于步骤记录。
+  String? _toolStatusText(String? name, String? status) {
     final isDone = status == 'done';
-    switch (name) {
-      case 'search_videos':
-      case 'search':
-        return isDone ? '已完成搜索' : '正在搜索影片…';
-      case 'get_video_detail':
-      case 'get_detail':
-        return isDone ? '已获取影片详情' : '正在获取影片详情…';
-      case 'get_hot_movies':
-      case 'get_recommendations':
-        return isDone ? '已获取推荐' : '正在挑选影片…';
-      default:
-        return isDone ? '已完成' : '正在处理…';
+
+    // 工具名 -> (进行中, 已完成)
+    const table = <String, List<String>>{
+      'search_videos': ['正在搜索影片…', '已搜索影片'],
+      'search': ['正在搜索影片…', '已搜索影片'],
+      'get_video_detail': ['正在获取影片详情…', '已获取影片详情'],
+      'get_detail': ['正在获取影片详情…', '已获取影片详情'],
+      'get_hot_movies': ['正在挑选影片…', '已获取热门影片'],
+      'get_recommendations': ['正在挑选影片…', '已生成推荐'],
+      'douban_lookup': ['正在查询豆瓣…', '已查询豆瓣'],
+      'tmdb_lookup': ['正在查询 TMDB…', '已查询 TMDB'],
+      'web_search': ['正在联网搜索…', '已联网搜索'],
+      'fetch_page': ['正在阅读网页…', '已阅读网页'],
+      'get_user_favorites': ['正在读取我的收藏…', '已读取我的收藏'],
+      'get_user_recent': ['正在读取观看记录…', '已读取观看记录'],
+      'get_current_time': ['正在确认当前时间…', '已确认当前时间'],
+      'glob': ['正在检索本地资料…', '已检索本地资料'],
+      'grep': ['正在检索本地资料…', '已检索本地资料'],
+      'bash': ['正在执行检索命令…', '已执行检索命令'],
+    };
+
+    final entry = table[name];
+    if (entry != null) return isDone ? entry[1] : entry[0];
+
+    // 未知工具：保留工具名，便于排查，同时避免出现无意义的「已完成」
+    if (name == null || name.isEmpty) {
+      return isDone ? '已完成一步' : '正在处理…';
     }
+    return isDone ? '已完成 $name' : '正在执行 $name…';
   }
 
   /// 滚动到底部（流式输出时直接跳转，避免动画堆积）
@@ -512,10 +604,12 @@ class _AiChatScreenState extends State<AiChatScreen> {
     );
   }
 
-  /// 消息列表（工具提示作为最后一项临时插入）
+  /// 消息列表（流式进行中的进度提示作为最后一项插入）
   Widget _buildMessageList(bool isDark) {
     final isWide = DeviceUtils.isTablet(context);
-    final hasToolStatus = _toolStatus != null;
+    // 只要还在等待回复就显示进度，而不是只在工具调用期间显示：
+    // 否则模型「思考 / 调工具」那段时间界面毫无反馈，看起来就像卡死了。
+    final showProgress = _isStreaming;
 
     return SelectionArea(
       child: ListView.builder(
@@ -527,12 +621,21 @@ class _AiChatScreenState extends State<AiChatScreen> {
           isWide ? 32 : 12,
           8,
         ),
-        itemCount: _messages.length + (hasToolStatus ? 1 : 0),
+        itemCount: _messages.length + (showProgress ? 1 : 0),
         itemBuilder: (context, index) {
-          if (hasToolStatus && index == _messages.length) {
-            return _buildToolStatusRow(isDark);
+          if (showProgress && index == _messages.length) {
+            return _buildProgressRow(isDark);
           }
-          return _buildMessageBubble(_messages[index], isDark, isWide);
+          // 正在流式输出的那条消息用纯文本渲染：Markdown 每次增量都要全量
+          // 重新解析，在手机上是明显的卡顿来源；回答结束后再切回 Markdown。
+          final isTailStreaming =
+              showProgress && index == _messages.length - 1;
+          return _buildMessageBubble(
+            _messages[index],
+            isDark,
+            isWide,
+            plainText: isTailStreaming,
+          );
         },
       ),
     );
@@ -541,8 +644,9 @@ class _AiChatScreenState extends State<AiChatScreen> {
   Widget _buildMessageBubble(
     AiChatMessage message,
     bool isDark,
-    bool isWide,
-  ) {
+    bool isWide, {
+    bool plainText = false,
+  }) {
     final isUser = message.isUser;
     final double maxWidth =
         isWide ? _wideBubbleWidth : MediaQuery.sizeOf(context).width * 0.78;
@@ -587,53 +691,89 @@ class _AiChatScreenState extends State<AiChatScreen> {
                     height: 20,
                     child: PulsingDotsIndicator(),
                   )
-                : GptMarkdown(
-                    message.content,
-                    style: FontUtils.poppins(
-                      fontSize: 14.5,
-                      height: 1.6,
-                      color: isDark
-                          ? const Color(0xFFe8e8e8)
-                          : const Color(0xFF2c3e50),
-                    ),
-                  )),
+                : (plainText
+                    // 流式输出中：纯文本，避免每个增量都全量解析 Markdown
+                    ? Text(
+                        message.content,
+                        style: FontUtils.poppins(
+                          fontSize: 14.5,
+                          height: 1.6,
+                          color: isDark
+                              ? const Color(0xFFe8e8e8)
+                              : const Color(0xFF2c3e50),
+                        ),
+                      )
+                    : GptMarkdown(
+                        message.content,
+                        style: FontUtils.poppins(
+                          fontSize: 14.5,
+                          height: 1.6,
+                          color: isDark
+                              ? const Color(0xFFe8e8e8)
+                              : const Color(0xFF2c3e50),
+                        ),
+                      ))),
       ),
     );
   }
 
-  /// 工具调用状态行
-  Widget _buildToolStatusRow(bool isDark) {
+  /// 流式进行中的进度提示
+  ///
+  /// 显示三样东西，缺一不可：
+  /// 1. 当前正在做什么（工具名映射后的中文，如「正在查询豆瓣…」）
+  /// 2. 已经等了多久（秒表）—— 没有它，「正在处理…」看起来和卡死没区别
+  /// 3. 最近完成的步骤 —— 证明 AI 确实在推进
+  Widget _buildProgressRow(bool isDark) {
+    const accent = Color(0xFF27ae60);
+    final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
+    final current = _toolStatus ??
+        (_steps.isEmpty ? '正在理解你的问题…' : '正在组织回答…');
+
     return Align(
       alignment: Alignment.centerLeft,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-        child: Row(
+        child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SizedBox(
-              width: 14,
-              height: 14,
-              child: _toolRunning
-                  ? const CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor:
-                          AlwaysStoppedAnimation<Color>(Color(0xFF27ae60)),
-                    )
-                  : const Icon(
-                      Icons.check_circle,
-                      size: 14,
-                      color: Color(0xFF27ae60),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(accent),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    current,
+                    style: FontUtils.poppins(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w500,
+                      color: accent,
                     ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '已等待 $_elapsedSeconds 秒',
+                  style: FontUtils.poppins(fontSize: 11.5, color: muted),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            Text(
-              _toolStatus ?? '',
-              style: FontUtils.poppins(
-                fontSize: 12.5,
-                color:
-                    isDark ? const Color(0xFFb0b0b0) : const Color(0xFF7f8c8d),
+            if (_steps.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(left: 22, top: 4),
+                child: Text(
+                  _steps.map((step) => '✓ $step').join('   '),
+                  style: FontUtils.poppins(fontSize: 11.5, color: muted),
+                ),
               ),
-            ),
           ],
         ),
       ),

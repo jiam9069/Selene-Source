@@ -31,6 +31,7 @@ import 'package:selene/models/ai_message.dart';
 import 'package:selene/services/ai_service.dart';
 import 'package:selene/services/api_service.dart';
 import 'package:selene/services/backend_service.dart';
+import 'package:selene/services/emby_service.dart';
 import 'package:selene/services/web_live_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -127,6 +128,59 @@ void main() {
     if (item.episodesTitles.isNotEmpty) {
       print('首集标题：${item.episodesTitles.first}');
     }
+  }, skip: skipReason, timeout: const Timeout(Duration(minutes: 5)));
+
+  test('私人影库：源 → 分类 → 列表 → 可播放地址', () async {
+    final sources = await EmbyService.fetchSources();
+    if (sources.isEmpty) {
+      print('该后端没有配置私人影库，跳过此用例');
+      return;
+    }
+    print('私人影库源 ${sources.length} 个：'
+        '${sources.map((s) => s.name).join('、')}');
+
+    // 1. 分类
+    final source = sources.first;
+    final views = await EmbyService.fetchViews(source.key);
+    expect(views, isNotEmpty, reason: '「${source.name}」没有返回任何分类');
+    print('分类 ${views.length} 个：${views.map((v) => v.name).join('、')}');
+
+    // 2. 列表
+    final view = views.first;
+    final items = await EmbyService.fetchList(
+      sourceKey: source.key,
+      viewId: view.id,
+      page: 1,
+    );
+    expect(items, isNotEmpty, reason: '分类「${view.name}」第 1 页为空');
+    print('「${view.name}」第 1 页 ${items.length} 条，'
+        '首条：${items.first.title}（${items.first.mediaType}）');
+
+    // 海报必须是绝对地址，否则界面上所有封面都会是空白
+    final withPoster =
+        items.firstWhere((i) => i.poster.isNotEmpty, orElse: () => items.first);
+    if (withPoster.poster.isNotEmpty) {
+      expect(withPoster.poster, startsWith('http'),
+          reason: '海报地址没有被补全为绝对地址：${withPoster.poster}');
+    }
+
+    // 3. 播放地址：复用既有详情链路（源标识 emby_<key>）
+    final target = items.first;
+    final detail = await ApiService.fetchSourceDetail(
+      'emby_${source.key}',
+      target.id,
+      sourceName: source.name,
+    );
+    expect(detail, isNotEmpty, reason: '私人影库详情解析失败（id=${target.id}）');
+    expect(detail.first.episodes, isNotEmpty,
+        reason: '私人影库详情没有解析出任何播放地址');
+    expect(detail.first.episodes.first, startsWith('http'),
+        reason: '播放地址必须是绝对地址');
+    print('播放地址：${detail.first.episodes.first}');
+
+    // 4. 分页约定：第 1 页 20 条意味着还有下一页
+    expect(EmbyService.isLastPage(items.length), items.length < EmbyService.pageSize,
+        reason: '末页判定与「每页 ${EmbyService.pageSize} 条」的约定不一致');
   }, skip: skipReason, timeout: const Timeout(Duration(minutes: 5)));
 
   test('网络直播：源列表可获取且流地址可解析', () async {

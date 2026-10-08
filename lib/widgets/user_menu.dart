@@ -11,7 +11,9 @@ import '../services/live_service.dart';
 import '../services/local_search_cache_service.dart';
 import '../services/version_service.dart';
 import '../services/backend_service.dart';
+import '../services/emby_service.dart';
 import '../screens/ai_chat_screen.dart';
+import '../screens/private_library_screen.dart';
 import '../utils/device_utils.dart';
 import '../utils/font_utils.dart';
 import 'update_dialog.dart';
@@ -44,6 +46,9 @@ class _UserMenuState extends State<UserMenu> {
   /// 后端是否提供 AI 问片（MoonTVPlus 且后台已启用）
   bool _aiEnabled = false;
 
+  /// 后端是否配置了私人影库（MoonTVPlus 的 Emby 源）
+  bool _embyEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -52,12 +57,15 @@ class _UserMenuState extends State<UserMenu> {
     _loadBackendCapabilities();
   }
 
-  /// 读取后端能力开关，决定是否展示 AI 问片入口
+  /// 读取后端能力开关，决定是否展示 AI 问片 / 私人影库入口
   Future<void> _loadBackendCapabilities() async {
     final config = await BackendService.getServerConfig();
+    // 私人影库要单独探一次，只有后端真的配了 Emby 源才显示入口
+    final embyAvailable = await EmbyService.isAvailable();
     if (!mounted) return;
     setState(() {
       _aiEnabled = config?.aiEnabled ?? false;
+      _embyEnabled = embyAvailable;
     });
   }
 
@@ -761,6 +769,28 @@ class _UserMenuState extends State<UserMenu> {
                           Navigator.of(context).push(
                             MaterialPageRoute(
                               builder: (context) => const AiChatScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                      Container(
+                        height: 1,
+                        color: widget.isDarkMode
+                            ? const Color(0xFF374151)
+                            : const Color(0xFFe5e7eb),
+                      ),
+                    ],
+                    // 私人影库入口（仅后端配置了 Emby 源时显示）
+                    if (_embyEnabled) ...[
+                      _buildInputOption(
+                        title: '私人影库',
+                        currentValue: '观看自我收藏的高清视频',
+                        icon: LucideIcons.libraryBig,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) =>
+                                  const PrivateLibraryScreen(),
                             ),
                           );
                         },
