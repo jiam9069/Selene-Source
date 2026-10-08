@@ -6,16 +6,82 @@ import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:provider/provider.dart';
 
 import '../models/ai_message.dart';
+import '../models/search_result.dart';
 import '../services/ai_service.dart';
+import '../services/sse_search_service.dart';
 import '../services/theme_service.dart';
 import '../utils/device_utils.dart';
 import '../utils/font_utils.dart';
 import '../widgets/pulsing_dots_indicator.dart';
 import '../widgets/windows_title_bar.dart';
+import 'player_screen.dart';
+
+/// 从回复与工具链里提取「可播放影片源」的搜索词（影片源直出的第一步）
+///
+/// 优先级（越靠前越像片名）：
+/// 1. 豆瓣/TMDB/站内搜索工具的 `query` 参数——它们本身就是片名；
+/// 2. 回复里的《片名》/「片名」——模型给出推荐时通常会这样写；
+/// 3. `web_search` 的 query——只有足够短、像片名的才采用，避免拿整句
+///   疑问去搜影片源搜出一堆无关结果。
+///
+/// 返回 null 表示提取不到，界面退化为手动「搜影片源」入口。
+String? extractPlayableSourceQuery({
+  required String reply,
+  required List<AiToolCall> toolChain,
+}) {
+  // 1) 标题类工具的 query 参数
+  const titleTools = {
+    'douban_lookup',
+    'tmdb_lookup',
+    'search_videos',
+    'search',
+  };
+  for (final call in toolChain) {
+    if (!titleTools.contains(call.name)) continue;
+    final args = call.args;
+    if (args is! Map) continue;
+    final query = args['query']?.toString().trim();
+    if (query != null && query.isNotEmpty) return query;
+  }
+
+  // 2) 书名号里的片名
+  final bookTitle =
+      RegExp(r'《([^》]{1,40})》').firstMatch(reply)?.group(1)?.trim();
+  if (bookTitle != null && bookTitle.isNotEmpty) return bookTitle;
+
+  final cornerTitle =
+      RegExp(r'「([^」]{1,40})」').firstMatch(reply)?.group(1)?.trim();
+  if (cornerTitle != null && cornerTitle.isNotEmpty) return cornerTitle;
+
+  // 3) 联网搜索词，仅短查询可用
+  for (final call in toolChain) {
+    if (call.name != 'web_search') continue;
+    final args = call.args;
+    if (args is! Map) continue;
+    final query = args['query']?.toString().trim();
+    if (query != null && query.isNotEmpty && query.length <= 20) {
+      return query;
+    }
+  }
+  return null;
+}
 
 /// AI 问片：与后端 `/api/ai/chat` 对话的流式聊天页
 class AiChatScreen extends StatefulWidget {
   const AiChatScreen({super.key});
+
+  /// 测试接缝：替换「点影片源卡片 → 进播放器」的跳转动作。
+  ///
+  /// [PlayerScreen] 内部依赖 media_kit（本机需装 libmpv），单测环境构建
+  /// 不了；测试注入一个只记录参数的空实现，既能断言跳转参数，
+  /// 又不会真的去初始化播放器。
+  @visibleForTesting
+  static void Function(
+    BuildContext context,
+    SearchResult result,
+    String stitle,
+    String stype,
+  )? sourceResultNavigatorOverride;
 
   @override
   State<AiChatScreen> createState() => _AiChatScreenState();
@@ -79,6 +145,15 @@ class _AiChatScreenState extends State<AiChatScreen> {
   bool _isAvailable = false;
   String? _unavailableMessage;
 
+  /// 影片源直出：当前进行中的搜索服务（一轮回复对应一次搜索）
+  SSESearchService? _sourceSearch;
+
+  /// 影片源搜索的流订阅（结果 / 进度 / 错误）
+  final List<StreamSubscription> _sourceSubs = [];
+
+  /// 影片源卡片数量上限：拿满就收线，避免列表过长拖垮首屏
+  static const int _maxSourceCards = 12;
+
   @override
   void initState() {
     super.initState();
@@ -90,6 +165,8 @@ class _AiChatScreenState extends State<AiChatScreen> {
     // 离开页面时取消订阅，后续事件不会再触发 setState
     _subscription?.cancel();
     _subscription = null;
+    // 影片源搜索：取消订阅并断开 SSE（内部会清掉 15 秒超时定时器）
+    unawaited(_stopSourceSearch());
     _flushTimer?.cancel();
     _flushTimer = null;
     _tickTimer?.cancel();
@@ -297,6 +374,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
     _tickTimer?.cancel();
     _tickTimer = null;
 
+    AiChatMessage? finished;
     setState(() {
       _isStreaming = false;
       _toolStatus = null;
@@ -319,8 +397,12 @@ class _AiChatScreenState extends State<AiChatScreen> {
                   '可能是模型服务异常，请再试一次。'
               : '（未收到回复，请稍后重试）';
         }
+        finished = last;
       }
     });
+
+    // 影片源直出：从工具参数/回复里提取片名，直接把可播放源摆到回答下面
+    _maybeStartSourceSearch(finished);
 
     // 重新启用输入框后把焦点还给用户（桌面端支持边等边打字）
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -788,8 +870,455 @@ class _AiChatScreenState extends State<AiChatScreen> {
                         isDark: isDark,
                       ),
                     ),
+                  // 影片源直出：回答完成后自动搜同名可播放源，
+                  // 搜不到词时退化为手动「搜影片源」入口
+                  if (message.sourceQuery != null ||
+                      message.showManualSourceSearch)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: _buildSourceSection(message, isDark),
+                    ),
                 ],
               ),
+      ),
+    );
+  }
+
+  /// 决定本条回复要不要发起影片源搜索（回复流结束后调用一次）
+  ///
+  /// 提取到片名就自动搜，把可播放源直接摆到回答下面；提取不到就挂一个
+  /// 手动「搜影片源」入口，由用户决定要不要拿原问题去搜。
+  void _maybeStartSourceSearch(AiChatMessage? target) {
+    if (target == null || !mounted || _isStreaming) return;
+
+    final query = extractPlayableSourceQuery(
+      reply: target.content,
+      toolChain: target.toolCalls,
+    );
+    if (query != null) {
+      unawaited(_startSourceSearch(target, query));
+      return;
+    }
+
+    final userText = _precedingUserText(target);
+    if (userText != null && userText.isNotEmpty) {
+      setState(() => target.showManualSourceSearch = true);
+    }
+  }
+
+  /// 取 [target] 之前最近的一条用户消息文本（手动搜索的兜底词）
+  String? _precedingUserText(AiChatMessage target) {
+    final idx = _messages.indexOf(target);
+    for (var i = idx - 1; i >= 0; i--) {
+      if (_messages[i].isUser) return _messages[i].content.trim();
+    }
+    return null;
+  }
+
+  /// 发起一轮影片源搜索，结果以卡片形式增量挂到 [target] 消息上
+  ///
+  /// 与搜索页共用 [SSESearchService]（`/api/search/ws`），但只取前
+  /// [_maxSourceCards] 张卡片：各源的结果到达即渲染，拿满就提前收线。
+  Future<void> _startSourceSearch(AiChatMessage target, String query) async {
+    if (!mounted) return;
+    await _stopSourceSearch();
+    if (!mounted) return;
+
+    final service = SSESearchService();
+    _sourceSearch = service;
+    final seen = <String>{};
+    final cards = <SearchResult>[];
+
+    setState(() {
+      target.sourceQuery = query;
+      target.sourceSearchRunning = true;
+      target.sourceSearchDone = false;
+      target.sourceSearchFailed = false;
+      target.sourceProgress = null;
+      target.showManualSourceSearch = false;
+      target.sourceCards.clear();
+    });
+
+    try {
+      await service.startSearch(query);
+    } catch (_) {
+      await _stopSourceSearch();
+      if (!mounted) return;
+      setState(() {
+        target.sourceSearchRunning = false;
+        target.sourceSearchDone = true;
+        target.sourceSearchFailed = true;
+      });
+      return;
+    }
+    if (!mounted) return;
+
+    // 各源结果增量到达：去重后立即上卡片，让用户在搜索没结束时就能点播
+    _sourceSubs.add(service.incrementalResultsStream.listen((batch) {
+      if (!mounted) return;
+      var changed = false;
+      for (final result in batch) {
+        if (cards.length >= _maxSourceCards) break;
+        if (seen.add('${result.source}|${result.id}')) {
+          cards.add(result);
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      setState(() {
+        target.sourceCards
+          ..clear()
+          ..addAll(cards);
+      });
+      _scrollToBottom();
+      if (cards.length >= _maxSourceCards) {
+        // 拿满上限就收线：继续等其余源只会让页面一直挂着「搜索中」
+        unawaited(_stopSourceSearch().then((_) {
+          if (!mounted) return;
+          setState(() {
+            target.sourceSearchRunning = false;
+            target.sourceSearchDone = true;
+            target.sourceProgress = null;
+          });
+        }));
+      }
+    }));
+
+    // 进度：显示「正在搜的源（已完成/总数）」；isComplete 收尾
+    _sourceSubs.add(service.progressStream.listen((progress) {
+      if (!mounted) return;
+      setState(() {
+        if (progress.isComplete) {
+          target.sourceSearchRunning = false;
+          target.sourceSearchDone = true;
+          target.sourceProgress = null;
+        } else if (progress.currentSource != null) {
+          target.sourceProgress =
+              '${progress.currentSource}（${progress.completedSources}/${progress.totalSources}）';
+        }
+      });
+    }));
+
+    // 错误：已有卡片时静默降级（部分源失败不影响其余卡片）；
+    // 一张都没有时标记失败，给出「换词重搜」出路。
+    _sourceSubs.add(service.errorStream.listen((_) {
+      if (!mounted || target.sourceCards.isNotEmpty) return;
+      setState(() {
+        target.sourceSearchRunning = false;
+        target.sourceSearchDone = true;
+        target.sourceSearchFailed = true;
+        target.sourceProgress = null;
+      });
+    }));
+  }
+
+  /// 停止当前影片源搜索：先退订（不再 setState），再断开 SSE 与超时定时器
+  Future<void> _stopSourceSearch() async {
+    final subs = List<StreamSubscription>.from(_sourceSubs);
+    _sourceSubs.clear();
+    final service = _sourceSearch;
+    _sourceSearch = null;
+    for (final sub in subs) {
+      await sub.cancel();
+    }
+    await service?.stopSearch();
+  }
+
+  /// 点击影片源卡片 → 直接进播放器（与搜索页同一套导航参数）
+  void _openSourceResult(AiChatMessage message, SearchResult result) {
+    final stitle = message.sourceQuery ?? result.title;
+    final stype = result.episodes.length > 1 ? 'tv' : 'movie';
+    final override = AiChatScreen.sourceResultNavigatorOverride;
+    if (override != null) {
+      override(context, result, stitle, stype);
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => PlayerScreen(
+          source: result.source,
+          id: result.id,
+          year: result.year,
+          title: result.title,
+          stitle: stitle,
+          stype: stype,
+        ),
+      ),
+    );
+  }
+
+  /// 没搜到结果时换一个词重搜
+  Future<void> _requerySourceSearch(AiChatMessage message) async {
+    final input = TextEditingController(text: message.sourceQuery ?? '');
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('换词重搜'),
+        content: TextField(
+          controller: input,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: '输入片名或关键词'),
+          onSubmitted: (value) => Navigator.of(ctx).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(input.text),
+            child: const Text('搜索'),
+          ),
+        ],
+      ),
+    );
+    input.dispose();
+    if (!mounted) return;
+    final query = (picked ?? '').trim();
+    if (query.isEmpty) return;
+    await _startSourceSearch(message, query);
+  }
+
+  /// 影片源直出区块：手动入口 / 搜索中 / 卡片列表 / 没搜到+换词重搜
+  Widget _buildSourceSection(AiChatMessage message, bool isDark) {
+    final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
+    const accent = Color(0xFF27ae60);
+
+    // 还没发起过搜索：只给手动入口
+    if (message.sourceQuery == null) {
+      if (!message.showManualSourceSearch) return const SizedBox.shrink();
+      return TextButton.icon(
+        onPressed: () {
+          final userText = _precedingUserText(message);
+          if (userText == null || userText.isEmpty) return;
+          unawaited(_startSourceSearch(message, userText));
+        },
+        style: TextButton.styleFrom(
+          foregroundColor: accent,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          minimumSize: Size.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+          side: const BorderSide(color: Color(0x6627ae60)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+        icon: const Icon(Icons.search, size: 15),
+        label: const Text('搜影片源', style: TextStyle(fontSize: 12.5)),
+      );
+    }
+
+    // 有结果：标题 + 可播放卡片（点击直接进播放器）
+    //
+    // 放在「搜索中」之前判断：结果是一条条流回来的，先到先看，
+    // 不必干等整个搜索结束（多源聚合常常十几秒）。
+    if (message.sourceCards.isNotEmpty) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Text('🎬', style: TextStyle(fontSize: 13)),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  '可播放源 · ${message.sourceQuery}',
+                  style: FontUtils.poppins(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color:
+                        isDark ? const Color(0xFFe8e8e8) : const Color(0xFF2c3e50),
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          for (final result in message.sourceCards)
+            _buildSourceCardRow(message, result, isDark),
+          if (message.sourceCards.length >= _maxSourceCards)
+            Padding(
+              padding: const EdgeInsets.only(top: 2, left: 4),
+              child: Text(
+                '已展示前 $_maxSourceCards 个结果',
+                style: FontUtils.poppins(fontSize: 11, color: muted),
+              ),
+            ),
+          // 卡片先到先看，搜索还没结束就在下面继续提示
+          if (message.sourceSearchRunning)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, left: 4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 11,
+                    height: 11,
+                    child: CircularProgressIndicator(strokeWidth: 1.6),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      '继续搜索中…${message.sourceProgress == null ? '' : ' ${message.sourceProgress}'}',
+                      style: FontUtils.poppins(fontSize: 11, color: muted),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      );
+    }
+
+    // 搜索中（还没有任何结果）
+    if (message.sourceSearchRunning) {
+      final progress = message.sourceProgress;
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            width: 13,
+            height: 13,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              '正在搜索影片源…${progress == null ? '' : ' $progress'}',
+              style: FontUtils.poppins(fontSize: 12, color: muted),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      );
+    }
+
+    // 没搜到（或搜索失败）：说明 + 换词重搜的出路
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.search_off, size: 14, color: muted),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                message.sourceSearchFailed
+                    ? '影片源搜索未成功，可能超时或未登录'
+                    : '暂时没搜到可播放源',
+                style: FontUtils.poppins(fontSize: 12, color: muted),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        TextButton(
+          onPressed: () => unawaited(_requerySourceSearch(message)),
+          style: TextButton.styleFrom(
+            foregroundColor: accent,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            minimumSize: Size.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            visualDensity: VisualDensity.compact,
+          ),
+          child: const Text('换词重搜', style: TextStyle(fontSize: 12.5)),
+        ),
+      ],
+    );
+  }
+
+  /// 一张可播放源卡片：海报 + 标题/年份/源/集数，点击进播放器
+  Widget _buildSourceCardRow(
+    AiChatMessage message,
+    SearchResult result,
+    bool isDark,
+  ) {
+    final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
+    final meta = <String>[
+      if (result.year.isNotEmpty) result.year,
+      if (result.sourceName.isNotEmpty) result.sourceName,
+      if (result.episodes.length > 1) '共${result.episodes.length}集',
+    ].join(' · ');
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => _openSourceResult(message, result),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 5),
+          child: Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: SizedBox(
+                  width: 38,
+                  height: 54,
+                  child: result.poster.isEmpty
+                      ? _posterPlaceholder(isDark)
+                      : Image.network(
+                          result.poster,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) =>
+                              _posterPlaceholder(isDark),
+                        ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      result.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: FontUtils.poppins(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                        color: isDark
+                            ? const Color(0xFFe8e8e8)
+                            : const Color(0xFF2c3e50),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      meta.isEmpty ? '点击播放' : meta,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: FontUtils.poppins(fontSize: 11.5, color: muted),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 6),
+              const Icon(
+                Icons.play_circle_fill,
+                color: Color(0xFF27ae60),
+                size: 26,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _posterPlaceholder(bool isDark) {
+    return Container(
+      color: isDark ? const Color(0xFF2a2a2a) : const Color(0xFFececec),
+      child: Icon(
+        Icons.movie,
+        size: 18,
+        color: isDark ? const Color(0xFF666666) : const Color(0xFFb0b0b0),
       ),
     );
   }

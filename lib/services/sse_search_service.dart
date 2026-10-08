@@ -449,11 +449,13 @@ class SSESearchService {
 
   /// 停止搜索
   Future<void> stopSearch() async {
-    await _subscription?.cancel();
-    _subscription = null;
-
+    // 超时定时器要先撤：后面的退订都是 await，一旦卡住（例如上游 SSE 流
+    // 在测试里没有真正结束），定时器会残留到页面销毁之后。
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
+
+    await _subscription?.cancel();
+    _subscription = null;
 
     _client?.close();
     _client = null;

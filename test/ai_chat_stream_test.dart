@@ -8,6 +8,9 @@
 /// 2. 流式期间必须有可见的进度反馈（当前步骤 + 已等待秒数），
 ///    否则模型思考的那几十秒界面看起来和卡死一样。
 /// 3. 正文必须真的被渲染出来，且结束后不能误报「未收到回复」。
+/// 4. 影片源直出：回复带片名时自动发起 /api/search/ws，结果渲染为可点卡片
+///    （上限 12 张，点击进播放器）；提取不到片名给手动入口，零结果/失败给
+///    「换词重搜」出路。
 library;
 
 import 'dart:async';
@@ -17,6 +20,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
+import 'package:selene/models/ai_message.dart';
 import 'package:selene/screens/ai_chat_screen.dart';
 import 'package:selene/services/theme_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -70,7 +74,12 @@ class _ControlledResponse extends Stream<List<int>>
   }
 
   Future<void> finish() async {
-    if (!_ctrl.isClosed) await _ctrl.close();
+    if (_ctrl.isClosed) return;
+    // 注意：不要 await close()。单订阅 StreamController 的 close() future
+    // 会等到唯一的订阅者消费完 done 才完成；如果这个响应从未被监听
+    // （例如用例没触发影片源搜索，setUp 里预建的那个实例），
+    // await close() 会永久挂起。fire-and-forget 关闭即可。
+    unawaited(_ctrl.close());
   }
 
   @override
@@ -225,6 +234,10 @@ String _visibleText(WidgetTester tester) {
 
 void main() {
   late _ControlledResponse aiResponse;
+  late _ControlledResponse searchResponse;
+
+  /// 记录每次 /api/search/ws 的查询词（按时间顺序），供「影片源直出」断言
+  final List<String> searchRequestQueries = [];
 
   /// 挂载真实的 AiChatScreen，并把 /api/ai/chat 指向可控响应流
   Future<void> mount(WidgetTester tester) async {
@@ -238,6 +251,14 @@ void main() {
         aiResponse.headers
             .set('content-type', 'text/event-stream; charset=utf-8');
         return aiResponse;
+      }
+      // 影片源直出：SSESearchService 走 /api/search/ws 拉增量结果
+      if (url.path.contains('/api/search/ws')) {
+        searchResponse = _ControlledResponse();
+        searchResponse.headers
+            .set('content-type', 'text/event-stream; charset=utf-8');
+        searchRequestQueries.add(url.queryParameters['q'] ?? '');
+        return searchResponse;
       }
       // server-config 等其余请求：声明这是开启了 AI 的 MoonTVPlus
       return _JsonResponse(json.encode({
@@ -283,11 +304,16 @@ void main() {
   setUp(() {
     // 每个用例开始前重置为「等待创建」状态
     aiResponse = _ControlledResponse();
+    searchResponse = _ControlledResponse();
+    searchRequestQueries.clear();
     chatRequestBodies.clear();
+    // PlayerScreen 依赖 media_kit（本机没有 libmpv），测试里换成只记参数的接缝
+    AiChatScreen.sourceResultNavigatorOverride = null;
   });
 
   tearDown(() async {
     await aiResponse.finish();
+    await searchResponse.finish();
   });
 
   testWidgets('真实工具名映射成有意义的中文，而不是无信息量的「已完成」',
@@ -405,6 +431,17 @@ void main() {
       isNot(contains('没有返回文字回答')),
       reason: '已经收到正文，不应误报模型无输出，实际界面文本：\n$text',
     );
+
+    // 回复含《星际穿越》会自动发起影片源搜索（15s 超时定时器），
+    // 补一个 complete 走正常收线路径撤掉定时器，再卸载页面
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":0,"completedSources":0}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
   });
 
   testWidgets('调用了工具但模型没输出正文时，给出可排查的提示而不是空气泡',
@@ -483,6 +520,16 @@ void main() {
       contains('流浪地球'),
       reason: '翻看历史时要能看到这条回答查过什么，实际界面文本：\n$after',
     );
+
+    // 回复含《流浪地球》会自动发起影片源搜索，补 complete 撤掉 15s 定时器再卸载
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":0,"completedSources":0}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
   });
 
   testWidgets('工具失败显示红 ✕，且不再被当成进行中', (tester) async {
@@ -591,6 +638,385 @@ void main() {
     aiResponse.emit('data: [DONE]\n\n');
     await aiResponse.finish();
     for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    // 第一轮回复含《流浪地球》会自动发起影片源搜索（15s 超时定时器），
+    // 补一个 complete 撤掉定时器，再卸载页面
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":0,"completedSources":0}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // 影片源直出（方案 A）：回复结束后自动搜 /api/search/ws，卡片点击进播放器
+  // ---------------------------------------------------------------------
+
+  group('extractPlayableSourceQuery 片名提取', () {
+    test('标题类工具的 query 参数优先于书名号', () {
+      expect(
+        extractPlayableSourceQuery(
+          reply: '我查到了《流浪地球》的资料。',
+          toolChain: [
+            AiToolCall(
+              name: 'douban_lookup',
+              args: {'query': '流浪地球'},
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        '流浪地球',
+      );
+      expect(
+        extractPlayableSourceQuery(
+          reply: '资料如下。',
+          toolChain: [
+            AiToolCall(
+              name: 'tmdb_lookup',
+              args: {'query': '沙丘2'},
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        '沙丘2',
+      );
+    });
+
+    test('回复里的《片名》《》与「片名」可兜底提取', () {
+      expect(
+        extractPlayableSourceQuery(
+          reply: '推荐《星际穿越》，硬核太空题材的标杆。',
+          toolChain: const [],
+        ),
+        '星际穿越',
+      );
+      expect(
+        extractPlayableSourceQuery(
+          reply: '「奥本海默」这部也很不错。',
+          toolChain: const [],
+        ),
+        '奥本海默',
+      );
+    });
+
+    test('web_search 词过长时不算片名，避免把长句当查询词', () {
+      // 短搜索词可以当片名兜底
+      expect(
+        extractPlayableSourceQuery(
+          reply: '结果如下。',
+          toolChain: [
+            AiToolCall(
+              name: 'web_search',
+              args: {'query': '流浪地球 豆瓣评分'},
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        '流浪地球 豆瓣评分',
+      );
+      // 超过 20 字的长搜索词不能当片名
+      expect(
+        extractPlayableSourceQuery(
+          reply: '结果如下。',
+          toolChain: [
+            AiToolCall(
+              name: 'web_search',
+              args: {
+                'query': '2024 年值得一看的高分科幻电影推荐列表有哪些',
+              },
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        isNull,
+      );
+    });
+
+    test('提取不到片名时返回 null（走手动搜索入口）', () {
+      expect(
+        extractPlayableSourceQuery(
+          reply: '这个问题我没法直接定位到具体影片。',
+          toolChain: const [],
+        ),
+        isNull,
+      );
+      // 只有工具名但没有 query 参数，也不应误提取
+      expect(
+        extractPlayableSourceQuery(
+          reply: '查询完成。',
+          toolChain: [
+            AiToolCall(
+              name: 'douban_lookup',
+              args: {'category': '科幻'},
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        isNull,
+      );
+    });
+  });
+
+  testWidgets('回复带片名时自动搜影片源，卡片点击直接进播放器', (tester) async {
+    await mount(tester);
+    await send(tester, '有《流浪地球》的资源吗');
+
+    aiResponse.emit('data: {"text":"《流浪地球》可直接观看。"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(
+      searchRequestQueries,
+      ['流浪地球'],
+      reason: '应按提取的片名自动发起 /api/search/ws 搜索',
+    );
+
+    // 搜索进行中：要有明确的进行态提示
+    final running = _visibleText(tester);
+    expect(
+      running,
+      contains('正在搜索影片源'),
+      reason: '搜索中要有进行态提示，实际界面文本：\n$running',
+    );
+
+    // 服务端回一条源结果 + 完成
+    searchResponse.emit(
+      'data: {"type":"source_result","source":"okzy","sourceName":"OK资源网",'
+      '"results":[{"id":"123","title":"流浪地球","poster":"","episodes":[],'
+      '"episodes_titles":[],"source":"okzy","source_name":"OK资源网",'
+      '"year":"2019"}]}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":1,"completedSources":1}\n\n',
+    );
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    final cards = _visibleText(tester);
+    expect(
+      cards,
+      contains('可播放源 · 流浪地球'),
+      reason: '卡片区应带搜索词标题，实际界面文本：\n$cards',
+    );
+    expect(
+      cards,
+      contains('2019 · OK资源网'),
+      reason: '卡片要带年份与源名，实际界面文本：\n$cards',
+    );
+    expect(
+      cards,
+      isNot(contains('正在搜索影片源')),
+      reason: 'complete 后不能还挂着搜索中，实际界面文本：\n$cards',
+    );
+
+    // 点卡片 → 直接进播放器（用接缝断言跳转参数，避开 media_kit）
+    final opened = <Map<String, Object?>>[];
+    AiChatScreen.sourceResultNavigatorOverride =
+        (context, result, stitle, stype) => opened.add(<String, Object?>{
+              'source': result.source,
+              'id': result.id,
+              'year': result.year,
+              'title': result.title,
+              'stitle': stitle,
+              'stype': stype,
+            });
+    await tester.tap(find.byIcon(Icons.play_circle_fill).first);
+    await tester.pump();
+
+    expect(opened, hasLength(1), reason: '点卡片应触发一次播放器跳转');
+    expect(opened.single['source'], 'okzy', reason: '应带源标识：$opened');
+    expect(opened.single['id'], '123', reason: '应带条目 id：$opened');
+    expect(opened.single['title'], '流浪地球', reason: '应带片名：$opened');
+    expect(opened.single['year'], '2019', reason: '应带年份：$opened');
+    expect(
+      opened.single['stitle'],
+      '流浪地球',
+      reason: '副标题用搜索词，与搜索页一致：$opened',
+    );
+    expect(
+      opened.single['stype'],
+      'movie',
+      reason: '单集按电影走播放参数：$opened',
+    );
+
+    // 卸载问片页，取消一切遗留定时器
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  });
+
+  testWidgets('提取不到片名时给手动入口；零结果时给「换词重搜」出路',
+      (tester) async {
+    await mount(tester);
+    await send(tester, '有什么好看的悬疑片');
+
+    aiResponse.emit('data: {"text":"这个话题我没法直接定位片名。"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    // 提取不到片名 → 不自动搜，只给手动入口
+    expect(
+      searchRequestQueries,
+      isEmpty,
+      reason: '提取不到片名不应自动发起搜索',
+    );
+    final manual = _visibleText(tester);
+    expect(
+      manual,
+      contains('搜影片源'),
+      reason: '应提供手动搜影片源入口，实际界面文本：\n$manual',
+    );
+
+    // 点入口 → 拿上一条用户消息作为搜索词
+    await tester.tap(find.text('搜影片源'));
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(
+      searchRequestQueries,
+      ['有什么好看的悬疑片'],
+      reason: '手动入口应拿原问题去搜',
+    );
+
+    // 服务端回 complete 但一条没有 → 零结果态 + 换词出路
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":0,"completedSources":2}\n\n',
+    );
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    final zero = _visibleText(tester);
+    expect(
+      zero,
+      contains('暂时没搜到可播放源'),
+      reason: '零结果要明确说明，实际界面文本：\n$zero',
+    );
+    expect(
+      zero,
+      contains('换词重搜'),
+      reason: '零结果要给换词出路，实际界面文本：\n$zero',
+    );
+
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  });
+
+  testWidgets('服务端回无法解析的事件时标记搜索失败并给重试出路', (tester) async {
+    await mount(tester);
+    await send(tester, '查查播放源');
+
+    aiResponse.emit('data: {"text":"《沙丘》资源正在确认。"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(searchRequestQueries, ['沙丘']);
+
+    // 服务端下发未知事件类型 → 解析失败 → errorStream → 失败态
+    searchResponse.emit('data: {"type":"bogus_event"}\n\n');
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    final failed = _visibleText(tester);
+    expect(
+      failed,
+      contains('影片源搜索未成功'),
+      reason: '搜索失败要有明确状态，实际界面文本：\n$failed',
+    );
+    expect(
+      failed,
+      contains('换词重搜'),
+      reason: '失败态要给重试出路，实际界面文本：\n$failed',
+    );
+
+    // 补一个 complete 收掉 15s 超时定时器（解析失败不会自动断流），再卸载
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":0,"completedSources":0}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  });
+
+  testWidgets('卡片最多 12 张：拿满即收线并提示已展示前 12 个结果', (tester) async {
+    await mount(tester);
+    await send(tester, '把《三体》的源都列出来');
+
+    aiResponse.emit('data: {"text":"正在收集《三体》的可播放源。"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(searchRequestQueries, ['三体']);
+
+    // 一次回 13 条 → 只应展示 12 张卡片并提前收线
+    final results = [
+      for (var i = 1; i <= 13; i++)
+        '{"id":"$i","title":"三体","poster":"","episodes":[],'
+            '"episodes_titles":[],"source":"src","source_name":"测试源",'
+            '"year":"2023"}',
+    ].join(',');
+    searchResponse.emit(
+      'data: {"type":"source_result","source":"src","sourceName":"测试源",'
+      '"results":[$results]}\n\n',
+    );
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(
+      find.byIcon(Icons.play_circle_fill),
+      findsNWidgets(12),
+      reason: '卡片上限应为 12 张',
+    );
+    final text = _visibleText(tester);
+    expect(
+      text,
+      contains('已展示前 12 个结果'),
+      reason: '满额时要说明只展示了前 12 个，实际界面文本：\n$text',
+    );
+    expect(
+      text,
+      isNot(contains('正在搜索影片源')),
+      reason: '拿满应提前收线，不再挂着搜索中，实际界面文本：\n$text',
+    );
+
+    // 补一个 complete 收掉 15s 超时定时器，再卸载
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":13,"completedSources":1}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
       await tester.pump(const Duration(milliseconds: 100));
     }
   });

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'search_result.dart';
+
 /// AI 问片对话角色
 enum AiChatRole { user, assistant }
 
@@ -70,6 +72,29 @@ class AiChatMessage {
   /// 较早对话被服务端压缩后写回的摘要（含前缀的完整正文）；
   /// 存在时服务端优先重建摘要而不再重建工具详情，避免上下文重新膨胀。
   final List<String> compressedSummaries;
+
+  // ── 影片源直出（仅本地展示，不进 toHistoryJson） ──────────────────
+
+  /// 本次回复发起影片源搜索时使用的搜索词；null 表示还没发起过搜索
+  String? sourceQuery;
+
+  /// 影片源搜索是否进行中
+  bool sourceSearchRunning = false;
+
+  /// 影片源搜索已结束（无论有没有结果）
+  bool sourceSearchDone = false;
+
+  /// 影片源搜索失败（连接错误 / 未登录 / 超时且无结果）
+  bool sourceSearchFailed = false;
+
+  /// 搜索进度文案（如「千视TV（3/10）」），null 表示没有进度可展示
+  String? sourceProgress;
+
+  /// 增量到达的可播放源卡片（按 source+id 去重，上限 12 条）
+  final List<SearchResult> sourceCards = [];
+
+  /// 提取不到搜索词时，在本条回复下展示手动「搜影片源」入口
+  bool showManualSourceSearch = false;
 
   AiChatMessage({
     required this.role,
