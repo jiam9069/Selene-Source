@@ -672,7 +672,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// 动态更新视频数据源
   /// 解析出最终可播放的地址（MoonTVPlus 适配）
   ///
   /// 两件事：
@@ -718,6 +717,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         '&source=${Uri.encodeComponent(source)}';
   }
 
+  /// 动态更新视频数据源
   Future<void> updateVideoUrl(String newUrl, {Duration? startAt}) async {
     print("newUrl: $newUrl, startAt: $startAt");
     try {
@@ -1282,7 +1282,12 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (currentDetail == null) return;
 
     // 获取当前播放的 URL
-    final currentUrl = currentDetail!.episodes[currentEpisodeIndex];
+    // 与本地播放保持一致：补全相对地址，并在源开启代理模式时改走服务器中转，
+    // 否则投屏设备同样会因为拿不到可直连地址而播放失败。
+    final currentUrl = await _resolveBackendPlayUrl(
+      currentDetail!.episodes[currentEpisodeIndex],
+    );
+    if (!mounted) return;
 
     // 显示设备选择对话框
     await showDialog(
