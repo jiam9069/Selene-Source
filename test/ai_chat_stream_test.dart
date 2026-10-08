@@ -8,9 +8,11 @@
 /// 2. 流式期间必须有可见的进度反馈（当前步骤 + 已等待秒数），
 ///    否则模型思考的那几十秒界面看起来和卡死一样。
 /// 3. 正文必须真的被渲染出来，且结束后不能误报「未收到回复」。
-/// 4. 影片源直出：回复带片名时自动发起 /api/search/ws，结果渲染为可点卡片
-///    （上限 12 张，点击进播放器）；提取不到片名给手动入口，零结果/失败给
-///    「换词重搜」出路。
+/// 4. 影片源直出：回复只提到 1 部片时自动发起 /api/search/ws，结果渲染为
+///    可点卡片（上限 12 张，点击进播放器）；提到多部片时**不**并发搜索，而是
+///    列成可点片名按钮，点哪个才搜哪个；零结果/失败给「换词重搜」出路。
+/// 5. 搜索词闸门：剧情描述类问句（「男主出车祸失忆一直在找妻子」）不发注定
+///    0 结果的搜索，改为请用户输入片名。
 library;
 
 import 'dart:async';
@@ -657,10 +659,87 @@ void main() {
   // 影片源直出（方案 A）：回复结束后自动搜 /api/search/ws，卡片点击进播放器
   // ---------------------------------------------------------------------
 
-  group('extractPlayableSourceQuery 片名提取', () {
-    test('标题类工具的 query 参数优先于书名号', () {
+  group('extractPlayableSourceQueries 片名提取（复数）', () {
+    test('查到空的工具结果不算片名（实测「记忆」「科幻」这类试探词）', () {
+      // 实测描述性提问时模型连试 6 个词，豆瓣全返回空对象 {}；
+      // 旧逻辑会拿第一个词去搜影片源，等于拿剧情描述搜片
+      List<String> extract(String query, String result) =>
+          extractPlayableSourceQueries(
+            reply: '搜索结果不太相关，我换个关键词再找找。',
+            toolChain: [
+              AiToolCall(
+                name: 'douban_lookup',
+                args: {'query': query},
+                status: 'done',
+                ok: true,
+                result: result,
+              ),
+            ],
+          );
+
+      expect(extract('记忆', '{}'), isEmpty, reason: '空对象说明没查到这部片');
+      expect(extract('科幻', '[]'), isEmpty, reason: '空数组同理');
       expect(
-        extractPlayableSourceQuery(
+        extract('记忆', '{"title":"记忆","year":"2022"}'),
+        ['记忆'],
+        reason: '真查到了数据就该算片名',
+      );
+      // 结果缺失时无法判断，仍按闸门决定（不因为拿不到结果就一律丢弃）
+      expect(
+        extractPlayableSourceQueries(
+          reply: '资料如下。',
+          toolChain: [
+            AiToolCall(
+              name: 'douban_lookup',
+              args: {'query': '流浪地球'},
+              status: 'done',
+              ok: true,
+            ),
+          ],
+        ),
+        ['流浪地球'],
+      );
+    });
+
+    test('加粗编号榜单项优先于工具参数与书名号（实测主推片单的写法）', () {
+      // 实测「推荐几部高分科幻片」的真实回复片段：主推的 5 部全在加粗编号行里，
+      // 一个书名号都没有；书名号反而只出现在结尾的补充说明
+      const realReply = '''
+给你按口碑排了个序。
+
+## 第一梯队 · 9分以上的硬科幻/科幻神作
+
+**1. 星际穿越（2014）｜9.4 分 · 223万人评价**
+诺兰导演，马修·麦康纳主演。
+
+**2. 盗梦空间（2010）｜9.4 分 · 236 万人评价**
+诺兰 + 小李子。
+
+**3. 机器人总动员 / WALL·E（2008）｜9.3 分 · 152 万人评价**
+皮克斯动画。
+
+**说明：** 你还没建立收藏记录。另外《降临》《黑客帝国》我没查到评分。
+''';
+      expect(
+        extractPlayableSourceQueries(reply: realReply, toolChain: const []),
+        ['星际穿越', '盗梦空间', '机器人总动员', '降临', '黑客帝国'],
+        reason: '榜单项应排在最前，且中外双名只取中文名',
+      );
+
+      // 加粗小标题不能被误当片名（有「（年份/竖线」才认）
+      expect(
+        extractPlayableSourceQueries(
+          reply: '**说明：** 见下。\n\n**硬核烧脑向**（《2012》《星际迷航》）这两部不错。',
+          toolChain: const [],
+        ),
+        ['2012', '星际迷航'],
+        reason: '加粗小标题不是片名，书名号才是',
+      );
+    });
+
+    test('标题类工具的 query 参数排在最前，且不再丢弃其余片名', () {
+      expect(
+        extractPlayableSourceQueries(
           reply: '我查到了《流浪地球》的资料。',
           toolChain: [
             AiToolCall(
@@ -671,87 +750,110 @@ void main() {
             ),
           ],
         ),
-        '流浪地球',
+        ['流浪地球'],
       );
+      // 工具查了 1 部、回复里推荐了 3 部：全部提取，工具那部在书名号之前
       expect(
-        extractPlayableSourceQuery(
-          reply: '资料如下。',
+        extractPlayableSourceQueries(
+          reply: '推荐《盗梦空间》《星际穿越》《沙丘》。',
           toolChain: [
             AiToolCall(
-              name: 'tmdb_lookup',
-              args: {'query': '沙丘2'},
+              name: 'douban_lookup',
+              args: {'query': '星际穿越'},
               status: 'done',
               ok: true,
             ),
           ],
         ),
-        '沙丘2',
+        ['星际穿越', '盗梦空间', '沙丘'],
       );
     });
 
-    test('回复里的《片名》《》与「片名」可兜底提取', () {
+    test('回复里的《片名》与「片名」全量提取、去重、限量', () {
       expect(
-        extractPlayableSourceQuery(
+        extractPlayableSourceQueries(
           reply: '推荐《星际穿越》，硬核太空题材的标杆。',
           toolChain: const [],
         ),
-        '星际穿越',
+        ['星际穿越'],
       );
       expect(
-        extractPlayableSourceQuery(
-          reply: '「奥本海默」这部也很不错。',
+        extractPlayableSourceQueries(
+          reply: '「奥本海默」和《奥本海默》都指同一部。',
           toolChain: const [],
         ),
-        '奥本海默',
+        ['奥本海默'],
+      );
+      // 一条推荐回复里十几个片名：旧实现 firstMatch 只取第一个，
+      // 其余全是死文本；现在全量取，只受 maxPlayableSourceQueries 限制
+      final many = List.generate(12, (i) => '《片名$i》').join('、');
+      final extracted = extractPlayableSourceQueries(
+        reply: many,
+        toolChain: const [],
+      );
+      expect(
+        extracted,
+        hasLength(maxPlayableSourceQueries),
+        reason: '候选数量应被 maxPlayableSourceQueries 截断：$extracted',
+      );
+      expect(extracted.first, '片名0', reason: '应按回复中的出现顺序排列');
+    });
+
+    test('书名号里的片名不受闸门限制：含疑问字的真片名照样提取', () {
+      // 《谁先爱上他的》《哪啊哪啊神去村》是真实片名，不能因为含「谁/哪」被误杀
+      expect(
+        extractPlayableSourceQueries(
+          reply: '推荐《谁先爱上他的》和《哪啊哪啊神去村》。',
+          toolChain: const [],
+        ),
+        ['谁先爱上他的', '哪啊哪啊神去村'],
       );
     });
 
-    test('web_search 词过长时不算片名，避免把长句当查询词', () {
-      // 短搜索词可以当片名兜底
+    test('web_search 词只有过闸门才采用', () {
+      // 短且像片名：采用
       expect(
-        extractPlayableSourceQuery(
+        extractPlayableSourceQueries(
           reply: '结果如下。',
           toolChain: [
             AiToolCall(
               name: 'web_search',
-              args: {'query': '流浪地球 豆瓣评分'},
+              args: {'query': '流浪地球'},
               status: 'done',
               ok: true,
             ),
           ],
         ),
-        '流浪地球 豆瓣评分',
+        ['流浪地球'],
       );
-      // 超过 20 字的长搜索词不能当片名
+      // 超过 20 字的长句不能当片名
       expect(
-        extractPlayableSourceQuery(
+        extractPlayableSourceQueries(
           reply: '结果如下。',
           toolChain: [
             AiToolCall(
               name: 'web_search',
-              args: {
-                'query': '2024 年值得一看的高分科幻电影推荐列表有哪些',
-              },
+              args: {'query': '2024 年值得一看的高分科幻电影推荐列表有哪些'},
               status: 'done',
               ok: true,
             ),
           ],
         ),
-        isNull,
+        isEmpty,
       );
     });
 
-    test('提取不到片名时返回 null（走手动搜索入口）', () {
+    test('提取不到片名时返回空（走手动输入入口）', () {
       expect(
-        extractPlayableSourceQuery(
+        extractPlayableSourceQueries(
           reply: '这个问题我没法直接定位到具体影片。',
           toolChain: const [],
         ),
-        isNull,
+        isEmpty,
       );
       // 只有工具名但没有 query 参数，也不应误提取
       expect(
-        extractPlayableSourceQuery(
+        extractPlayableSourceQueries(
           reply: '查询完成。',
           toolChain: [
             AiToolCall(
@@ -762,7 +864,63 @@ void main() {
             ),
           ],
         ),
+        isEmpty,
+      );
+    });
+  });
+
+  group('normalizePlayableSourceQuery 搜索词闸门', () {
+    test('剧情描述被挡下（实测这类词在 73 个源上 0 结果）', () {
+      for (final query in [
+        '车祸失忆 寻找妻子', // 实测：0 结果 / 73 源、白等 9 秒
+        '就是那个男主出车祸失忆了 一直在找自己妻子的电影叫什么',
+        '有什么好看的悬疑片',
+        '推荐几部高分科幻片',
+        '本周有什么热门电影',
+        '2024 年值得一看的高分科幻电影推荐列表有哪些',
+        'what is the movie about a man with amnesia',
+      ]) {
+        expect(
+          normalizePlayableSourceQuery(query),
+          isNull,
+          reason: '「$query」是问句/描述，不该拿去搜影片源',
+        );
+      }
+    });
+
+    test('像片名的词照常放行', () {
+      for (final query in [
+        '流浪地球',
+        '沙丘2',
+        'The Shawshank Redemption',
+        '三体',
+      ]) {
+        expect(
+          normalizePlayableSourceQuery(query),
+          equals(query),
+          reason: '「$query」像片名，应放行',
+        );
+      }
+    });
+
+    test('带空格的词剥掉元数据与续集编号后，只剩一段才当片名', () {
+      // 片名 + 元数据词 → 留下片名
+      expect(normalizePlayableSourceQuery('流浪地球 豆瓣评分'), '流浪地球');
+      expect(normalizePlayableSourceQuery('流浪地球 4K 国语'), '流浪地球');
+      // 片名 + 续集编号 → 合并成采集源里的常见写法
+      expect(normalizePlayableSourceQuery('沙丘 2'), '沙丘2');
+      expect(normalizePlayableSourceQuery('流浪地球 2 4K'), '流浪地球2');
+      // 剩下多段说明是剧情描述，挡下
+      expect(normalizePlayableSourceQuery('车祸失忆 寻找妻子'), isNull);
+    });
+
+    test('书名号/引号包裹视为「模型标注的片名」，只校验长度', () {
+      expect(normalizePlayableSourceQuery('《谁先爱上他的》'), '谁先爱上他的');
+      expect(normalizePlayableSourceQuery('「奥本海默」'), '奥本海默');
+      expect(
+        normalizePlayableSourceQuery('《${'长' * 41}》'),
         isNull,
+        reason: '超过 40 字的书名号内容不是片名',
       );
     });
   });
@@ -862,10 +1020,11 @@ void main() {
     }
   });
 
-  testWidgets('提取不到片名时给手动入口；零结果时给「换词重搜」出路',
+  testWidgets('描述性问句不发注定失败的搜索，改为请用户输入片名；输入后走零结果出路',
       (tester) async {
     await mount(tester);
-    await send(tester, '有什么好看的悬疑片');
+    // 实测这句话拿去搜影片源：73 个源 0 结果、白等 9 秒
+    await send(tester, '就是那个男主出车祸失忆了一直在找妻子的电影');
 
     aiResponse.emit('data: {"text":"这个话题我没法直接定位片名。"}\n\n');
     await tester.pump(const Duration(milliseconds: 50));
@@ -875,28 +1034,44 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
     }
 
-    // 提取不到片名 → 不自动搜，只给手动入口
+    // 闸门挡下描述句：一个请求都不该发出去
     expect(
       searchRequestQueries,
       isEmpty,
-      reason: '提取不到片名不应自动发起搜索',
+      reason: '描述性问句不该自动发起影片源搜索（实测 0 结果 / 73 源）',
     );
     final manual = _visibleText(tester);
     expect(
       manual,
-      contains('搜影片源'),
-      reason: '应提供手动搜影片源入口，实际界面文本：\n$manual',
+      contains('没识别到片名'),
+      reason: '要说清为什么没搜，实际界面文本：\n$manual',
+    );
+    expect(
+      manual,
+      contains('输入片名搜源'),
+      reason: '要给出「输入片名」的出路，实际界面文本：\n$manual',
     );
 
-    // 点入口 → 拿上一条用户消息作为搜索词
-    await tester.tap(find.text('搜影片源'));
+    // 点入口 → 弹输入框（不是拿原问题直接搜）
+    await tester.tap(find.text('输入片名搜源'));
     for (var i = 0; i < 8; i++) {
       await tester.pump(const Duration(milliseconds: 100));
     }
     expect(
       searchRequestQueries,
-      ['有什么好看的悬疑片'],
-      reason: '手动入口应拿原问题去搜',
+      isEmpty,
+      reason: '输入片名之前仍不应发搜索请求',
+    );
+    await tester.enterText(find.byType(TextField).last, '流浪地球');
+    await tester.pump();
+    await tester.tap(find.text('搜索'));
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(
+      searchRequestQueries,
+      ['流浪地球'],
+      reason: '手动输入片名后才发起搜索',
     );
 
     // 服务端回 complete 但一条没有 → 零结果态 + 换词出路
@@ -918,6 +1093,102 @@ void main() {
       reason: '零结果要给换词出路，实际界面文本：\n$zero',
     );
 
+    await tester.pumpWidget(const SizedBox());
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  });
+
+  testWidgets('回复提到多部片时列成可点片名按钮：点哪个才搜哪个', (tester) async {
+    await mount(tester);
+    await send(tester, '推荐几部高分科幻片');
+
+    // 实测真实回复里有 15 个《片名》，旧实现只搜第一个
+    aiResponse.emit(
+      'data: {"text":"推荐《星际穿越》《盗梦空间》《沙丘》《降临》《月球》。"}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    // 多部片：不替用户猜，一个搜索都不发
+    expect(
+      searchRequestQueries,
+      isEmpty,
+      reason: '多个片名候选时应等用户点选，不并发发起搜索',
+    );
+    final chips = _visibleText(tester);
+    expect(
+      chips,
+      contains('回复里提到 5 部'),
+      reason: '要说明回复里有几部可选，实际界面文本：\n$chips',
+    );
+    for (final title in ['星际穿越', '盗梦空间', '沙丘', '降临', '月球']) {
+      expect(
+        chips,
+        contains(title),
+        reason: '片名「$title」应渲染成可点按钮，实际界面文本：\n$chips',
+      );
+    }
+
+    // 点第 2 部 → 只搜这一部
+    await tester.tap(find.text('盗梦空间'));
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(
+      searchRequestQueries,
+      ['盗梦空间'],
+      reason: '点哪个片名就只搜哪一个',
+    );
+    // 按钮组常驻：出结果后仍能换下一部
+    final afterTap = _visibleText(tester);
+    expect(
+      afterTap,
+      contains('星际穿越'),
+      reason: '搜完之后按钮组仍应在，方便换片，实际界面文本：\n$afterTap',
+    );
+
+    searchResponse.emit(
+      'data: {"type":"source_result","source":"okzy","sourceName":"OK资源网",'
+      '"results":[{"id":"9","title":"盗梦空间","poster":"","episodes":[],'
+      '"episodes_titles":[],"source":"okzy","source_name":"OK资源网",'
+      '"year":"2010"}]}\n\n',
+    );
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    final cards = _visibleText(tester);
+    expect(
+      cards,
+      contains('可播放源 · 盗梦空间'),
+      reason: '卡片区标题应是被点的那一部，实际界面文本：\n$cards',
+    );
+
+    // 再点第 3 部 → 换一部重搜
+    await tester.tap(find.text('沙丘'));
+    await tester.pump();
+    // 第二轮搜索要先收掉上一轮 SSE（stopSearch 里有一串 await），这些续体挂在
+    // 真实事件循环上，fake async 里只靠 pump 推不动，必须放行一次真实 turn；
+    // 否则断言会看到「点了没反应」的假象（生产是真实事件循环，无此问题）。
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)));
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(
+      searchRequestQueries,
+      ['盗梦空间', '沙丘'],
+      reason: '换一部片名应重新发起搜索',
+    );
+
+    searchResponse.emit(
+      'data: {"type":"complete","totalResults":1,"completedSources":1}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 100));
     await tester.pumpWidget(const SizedBox());
     for (var i = 0; i < 5; i++) {
       await tester.pump(const Duration(milliseconds: 100));

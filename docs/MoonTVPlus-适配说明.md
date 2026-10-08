@@ -278,27 +278,58 @@ data: [DONE]
 
 流程（纯客户端，不改服务端）：
 
-1. **片名提取** `extractPlayableSourceQuery`，按优先级：
-   1. 标题类工具参数：`douban_lookup` / `tmdb_lookup` / `search_videos` /
-      `search` 的 `args.query`；
-   2. 回复里的 `《片名》`（≤40 字），其次 `「片名」`；
-   3. `web_search` 的 `args.query` 且 ≤20 字（更长的是长句，不是片名）。
+1. **片名提取** `extractPlayableSourceQueries`（**复数**，1.6.12 之后未发版），按优先级：
+   1. 加粗编号榜单项里的片名（`**1. 星际穿越（2014）｜9.4 分**`）——模型写
+      「高分片单」时主推的片子走这种写法，实测那次主推的 5 部**一个书名号
+      都没有**，只看书名号会全部漏掉；为免把 `**说明：**` 这类加粗小标题误认
+      成片名，只认「编号 + 后跟（年份）或 ｜/|」的形式；
+   2. 标题类工具参数：`douban_lookup` / `tmdb_lookup` / `search_videos` /
+      `search` 的 `args.query`，但**查了却什么都没查到**（`{}` / `[]`）的
+      不算数——实测模型会拿「科幻」「记忆」「失忆 寻找妻子 车祸」去试查豆瓣，
+      返回的全是空对象，这些词只是它的猜测；
+   3. 回复里的 `《片名》`（≤40 字）与 `「片名」`——模型显式标注，全量取用，
+      不受搜索词闸门限制（《谁先爱上他的》这类含疑问字的真片名不能被误杀）；
+   4. `web_search` 的 `args.query`，必须过闸门。
 
-   都取不到 → 不自动搜，在回答下挂「搜影片源」入口，点击后拿**上一条用户
-   消息**去搜。
-2. **搜索**：复用聚合搜索的 `SSESearchService`（`GET /api/search/ws?q=…`），
+   取到的片名去重、封顶 **8 个**（`maxPlayableSourceQueries`）。**只取到 1 个
+   就自动搜**（旧行为）；**多个不并发搜索**，而是列成一组可点片名按钮，点哪个
+   才搜哪个——搜索是串行的、每轮十几秒，替用户猜「哪 5 部」既慢又容易猜错。
+   一个都取不到时再退一步看**上一条用户消息**里有没有《片名》，仍然没有才挂
+   手动入口。
+2. **搜索词闸门** `normalizePlayableSourceQuery`（1.6.12 之后新增，未发版）：影片源检索是
+   跨采集源的关键词标题匹配，拿剧情描述去搜必然空手而归（实测「车祸失忆
+   寻找妻子」在 **73 个源上 0 条结果**、白等 9 秒）。因此发起搜索前先过闸门：
+   - 带 `?`/`？`，或命中中文疑问词（什么/怎么/哪/为什么/多少/谁/介绍/推荐…）
+     → 挡下；
+   - 纯外文片名（`The Shawshank Redemption`）允许空格、放宽到 60 字；外文
+     问句按 who/what/is/are 这类词挡下；
+   - 中文带空格的自由词：先剥掉元数据词（豆瓣/评分/剧情/简介/4K/国语…）与
+     续集编号（`沙丘 2` → `沙丘2`），**只剩一段**才当片名；剩多段即判定为
+     「车祸失忆 寻找妻子」这类剧情描述，挡下；
+   - 书名号/引号包裹的一律视为模型标注的片名，只校验长度。
+   挡下后**不发注定 0 结果的搜索**，改为在回答下显示「没识别到片名，影片源需要
+   按片名搜」+「输入片名搜源」，由用户给出片名后再搜。
+3. **搜索**：复用聚合搜索的 `SSESearchService`（`GET /api/search/ws?q=…`），
    `startSearch` 先校验登录态与服务器地址，再挂增量结果 / 进度 / 错误三条流。
    15 秒超时由 `complete` 事件、`stopSearch()` 或页面 dispose 取消。
-3. **卡片**：按 `source|id` 去重，**封顶 12 张**，拿满即提前收线；卡片显示
+4. **卡片**：按 `source|id` 去重，**封顶 12 张**，拿满即提前收线；卡片显示
    `年份 · 源名 · 共N集`，海报缺失时用占位图标（离线/测试环境不发网络请求）。
    点卡片进 `PlayerScreen(source, id, year, title, stitle:, stype:)`，
    参数与搜索页完全一致。
-4. **状态**：进行中显示「正在搜索影片源… 当前源（x/y）」；一旦有卡片就先渲染
+5. **状态**：进行中显示「正在搜索影片源… 当前源（x/y）」；一旦有卡片就先渲染
    卡片、下面再跟一行「继续搜索中…」（结果是一条条流回来的，不干等整个搜索）；
    0 条显示「暂时没搜到可播放源」；出错或超时显示「影片源搜索未成功」，
    两者都给「换词重搜」（弹输入框改词重搜）。
-5. **history 隔离**：搜索状态与卡片只挂在 `AiChatMessage` 的展示字段上，
-   `toHistoryJson()` 不含它们，回喂服务端的 history 完全不受影响。
+6. **多片名按钮组**：挂在正文**下方**且常驻——结果到达时列表会自动滚到底，
+   按钮就在视野里，点一下换下一部；当前正在展示的那一部按钮变绿底白字并置灰
+   （同一部再点一次没有新信息）。
+7. **history 隔离**：搜索状态、卡片与片名候选只挂在 `AiChatMessage` 的展示
+   字段上，`toHistoryJson()` 不含它们，回喂服务端的 history 完全不受影响。
+
+> 「换词重搜 / 输入片名搜源」对话框的输入控制器由对话框自己的 State 持有
+> （`_SourceQueryDialog`）。不能在 `showDialog` 返回后立刻 `dispose`：退场动画
+> 期间 TextField 仍会重建并 addListener，会抛「A TextEditingController was
+> used after being disposed」。
 
 ### 2.9 新增：私人影库浏览入口
 
@@ -354,6 +385,7 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 | `lib/screens/private_library_screen.dart` | 私人影库浏览页（源 → 分类 → 条目 → 播放） |
 | `test/moontvplus_compat_test.dart` | 适配层回归测试（夹具取自真实响应） |
 | `test/ai_chat_stream_test.dart` | AI 问片流式渲染 + 影片源直出回归测试 |
+| `test/ai_reply_fixture_test.dart`、`test/fixtures/ai_reply_*.json` | 真实模型回复回放：多片名按钮与搜索词闸门（夹具取自真实 `/api/ai/chat` 响应） |
 | `test/emby_private_library_test.dart` | 私人影库模型与分页单元测试 |
 | `test/private_library_screen_test.dart` | 私人影库页面渲染测试 |
 | `test/bottom_nav_test.dart` | 底栏 7 项窄屏不溢出回归测试 |
@@ -391,8 +423,11 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
    - `test/moontvplus_compat_test.dart`：适配层协议解析
    - `test/ai_chat_stream_test.dart`：用真实 SSE 事件序列驱动真实
      `AiChatScreen`，断言工具名映射、进度反馈、正文渲染、history 回喂结构，
-     以及影片源直出（片名提取单测 + 自动搜并点播、手动入口与零结果、
-     解析失败、12 张上限；`/api/search/ws` 用可控 SSE 响应驱动）
+     以及影片源直出（片名提取单测 + 自动搜并点播、多片名按钮、搜索词闸门、
+     输入片名入口、解析失败、12 张上限；`/api/search/ws` 用可控 SSE 响应驱动）
+   - `test/ai_reply_fixture_test.dart`：**真实模型回复**回放（夹具见
+     `test/fixtures/`，取自真实实例的 `/api/ai/chat` SSE），锁住
+     「主推片单写在加粗编号行里」与「剧情描述问句不发搜索」两处真实行为
    - `test/emby_private_library_test.dart`：私人影库模型与分页规则
    - `test/private_library_screen_test.dart`：用真实形状响应驱动真实
      `PrivateLibraryScreen`，断言标题 / 源选择 / 分类 / 条目 / 徽标
@@ -406,7 +441,7 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
    —— 默认跳过，需要在能访问真实后端的机器上显式开启，
    会实际调用 Emby 详情、私人影库三级链路、网络直播解析与 AI 流式对话。
 
-写 widget 测试时本项目踩过的三个坑（都已在 `test/ai_chat_stream_test.dart`
+写 widget 测试时本项目踩过的四个坑（都已在 `test/ai_chat_stream_test.dart`
 里规避，改测试时注意别改回去）：
 
 - 伪造 HTTP 响应用的是**单订阅** `StreamController`，`await close()` 要等唯一
@@ -420,6 +455,11 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 - `PlayerScreen` 依赖 media_kit（本机没装 `libmpv`），在单测里构建不出来。
   `AiChatScreen.sourceResultNavigatorOverride` 是为此留的测试接缝，注入一个
   只记参数的回调来断言跳转参数。
+- 从**第二轮**影片源搜索起（点第二个片名按钮换片），要先收掉上一轮的 SSE
+  （`stopSearch()` 里一串 await），这些续体挂在真实事件循环上，fake async 里
+  只靠 `pump()` 推不动，表现为「点了没反应」。测试里用一次
+  `await tester.runAsync(() => Future.delayed(...))` 放行真实 turn 即可；
+  生产是真实事件循环，不受影响。
 
 ---
 
@@ -428,10 +468,16 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 - Emby 源在**本地搜索模式**下不可用（该模式下客户端直连采集接口，
   无法访问 MoonTVPlus 的 Emby 私有接口）。请使用服务器搜索模式。
 - AI 问片已适配新协议（`EnableNewMode`）的工具链富展示与 history 回喂
-  （见 2.8.2）。影片源直出依赖**片名提取启发式**：回复里没带片名、也没查到片名
-  参数时，会退化为手动「搜影片源」入口 —— 属预期行为而非缺陷（宁可让人点一下，
-  也不拿一整句问话去搜出一堆无关结果）。
-- 影片源直出卡片封顶 12 张、单轮 15 秒超时；只展示聚合搜索能返回的源，
-  不做二次分页或按源筛选。
+  （见 2.8.2）。影片源直出依赖**片名提取启发式**（见 2.8.3）：回复与用户问句里
+  都提不出片名时，会显示「没识别到片名 / 输入片名搜源」而不是拿一整句剧情描述
+  去搜 —— 属预期行为而非缺陷（实测这类问句在 73 个采集源上 0 结果、白等 9 秒）。
+- 片名提取仍是**启发式**，无法保证覆盖所有模型写法：实测常见的「加粗编号榜单项
+  + 书名号补充说明」两种已覆盖，但模型若用纯自然段罗列片名（无书名号、无编号），
+  仍会退化为手动输入片名。真实模型回复已固化成 fixture 回归测试
+  （`test/ai_reply_fixture_test.dart`），改提取逻辑时以它为准绳。
+- 影片源直出卡片封顶 12 张、片名候选封顶 8 个、单轮 15 秒超时；只展示聚合搜索
+  能返回的源，不做二次分页或按源筛选。
+- 多片名按钮组是**按需搜索**（点哪个搜哪个），不并发发起多次聚合搜索：每轮
+  搜索串行十几秒，N 部并发既打满服务端也没人看得过来。
 - 超分（Anime4K）、弹幕、观影室、追番订阅、网盘、书籍、漫画、音乐等
   MoonTVPlus 专有功能本次未纳入适配范围。

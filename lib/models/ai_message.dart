@@ -96,6 +96,12 @@ class AiChatMessage {
   /// 提取不到搜索词时，在本条回复下展示手动「搜影片源」入口
   bool showManualSourceSearch = false;
 
+  /// 本条回复里提取到的片名候选（去重、限量）。
+  ///
+  /// 只有**多个**候选时才会用到：此时渲染成一组可点按钮，点哪个才搜哪个，
+  /// 客户端不替用户猜。恰好 1 个候选不走这里——那时直接自动搜索。
+  final List<String> sourceQueryCandidates = [];
+
   AiChatMessage({
     required this.role,
     required this.content,

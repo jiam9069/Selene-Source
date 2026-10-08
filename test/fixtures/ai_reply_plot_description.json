@@ -1,0 +1,56 @@
+{
+ "question": "就是那个男主出车祸失忆了，一直在找自己妻子的电影叫什么",
+ "reply": "我来搜一下这部片子。搜索结果不太相关，我换个关键词再找找。搜索结果跑偏了，我再试几个方向。让我换个搜索方式。",
+ "toolCalls": [
+  {
+   "name": "web_search",
+   "args": {
+    "query": "电影 男主 出车祸 失忆 寻找妻子 剧情"
+   },
+   "result": "\n标题: タルコフのキラ100体キルってどれくらいの人がするんですか ...\n摘要: タルコフのキラ100体キルってどれくらいの人がするんですか？また、どれくらい難しい・時間がかかるか初心者にもわかる ...\n来源: https://det…（超长结果已截断，提取逻辑用不到）",
+   "ok": true
+  },
+  {
+   "name": "douban_lookup",
+   "args": {
+    "kind": "movie",
+    "query": "失忆 寻找妻子 车祸"
+   },
+   "result": "{}",
+   "ok": true
+  },
+  {
+   "name": "douban_lookup",
+   "args": {
+    "kind": "movie",
+    "query": "失忆 妻子"
+   },
+   "result": "{}",
+   "ok": true
+  },
+  {
+   "name": "web_search",
+   "args": {
+    "query": "豆瓣 电影 男主角车祸失忆 满世界找老婆 剧情 豆瓣"
+   },
+   "result": "\n标题: 豆 - Wikipedia\n摘要: 豆は菽穀類（しゅこくるい、 英: Pulse crops）と言われ広義の 穀物 に含まれる。 また 日本語 においては、小さいものや形の似たものを豆と表現する（後述）。\n来源: https://…（超长结果已截断，提取逻辑用不到）",
+   "ok": true
+  },
+  {
+   "name": "web_search",
+   "args": {
+    "query": "电影 男主 车祸 失忆 找老婆 名字"
+   },
+   "result": "\n标题: How can I download TVer from the US? : r/JTV - Reddit\n摘要: I got advice from a Japanese friend who used a VPN togeth…（超长结果已截断，提取逻辑用不到）",
+   "ok": true
+  },
+  {
+   "name": "douban_lookup",
+   "args": {
+    "query": "记忆"
+   },
+   "result": "{}",
+   "ok": true
+  }
+ ]
+}

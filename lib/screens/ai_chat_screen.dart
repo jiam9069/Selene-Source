@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -16,20 +17,173 @@ import '../widgets/pulsing_dots_indicator.dart';
 import '../widgets/windows_title_bar.dart';
 import 'player_screen.dart';
 
-/// 从回复与工具链里提取「可播放影片源」的搜索词（影片源直出的第一步）
+/// 一条回复里最多取几个片名候选
+///
+/// 多个候选只渲染成按钮、**不**并发发起搜索（点哪个才搜哪个），所以这里可以
+/// 宽松些；只用来限制按钮行数，避免一条推荐回答刷出十几行点击热区。
+const int maxPlayableSourceQueries = 8;
+
+/// 中日韩文字：用来区分「外文片名」与「中文描述句」
+final RegExp _hasCjk = RegExp(r'[\u4e00-\u9fff]');
+
+/// 中文疑问/请求类字眼：命中即认定是问句而非片名
+final RegExp _cjkQuestionMarkers = RegExp(
+  r'什么|怎么|怎样|如何|哪|为什么|多少|是谁|谁演|介绍|推荐|类似|求|'
+  r'有没有|想看|叫什么|吗|呢',
+);
+
+/// 外文问句里的疑问/泛化词
+final RegExp _asciiQuestionMarkers = RegExp(
+  r'\b(who|what|which|where|when|why|how|is|are|was|were|do|does|did|'
+  r'can|could|movie|film|recommend|similar)\b',
+);
+
+/// 纯数字段（「沙丘 2」里的 `2`）
+final RegExp _numericSegment = RegExp(r'^[0-9]{1,4}$');
+
+/// 元数据词：出现在联网搜索词里表示「关于某片的信息」，不是片名本身
+const Set<String> _metadataWords = {
+  '豆瓣', '豆瓣评分', '豆瓣电影', '评分', '影评', '简介', '剧情', '演员', '主演',
+  '上映', '票房', '资源', '在线', '在线观看', '在线看', '下载', '预告', '解说',
+  '解析', '结局', '彩蛋', '榜单', '排名', '剧照', '台词', '主题曲', '百度百科',
+  '4k', '1080p', '720p', 'hd', '蓝光', '高清', '国语', '粤语', '中字', '双语',
+  '完整版', '免费', 'top', 'imdb', 'wiki',
+};
+
+/// 书名号/引号配对表，用于判断「整词是否被包裹」
+const Map<String, String> _wrapperPairs = {
+  '《': '》',
+  '「': '」',
+  '【': '】',
+  '“': '”',
+  '"': '"',
+  "'": "'",
+};
+
+/// 整个词是否被书名号/引号包裹（模型显式标注「这是片名」的信号）
+bool _isWholeWrapped(String text) {
+  if (text.length < 2) return false;
+  final close = _wrapperPairs[text[0]];
+  return close != null && text.endsWith(close);
+}
+
+/// 搜索词闸门：判断一段自由文本「像不像片名」，像就返回可用的搜索词
+///
+/// 影片源检索是跨采集源的关键词标题匹配，拿剧情描述去搜必然空手而归——
+/// 实测「车祸失忆 寻找妻子」在 73 个源上返回 0 条结果、白等 9 秒。所以要在
+/// 发起搜索前先过这道闸门：不像片名的词一律不发搜索，改请用户输入片名。
+///
+/// [trusted] 为 true 表示来源已明确声明这是片名（书名号 / 引号包裹）：此时
+/// 只校验长度与换行——《谁先爱上他的》这类含疑问字的真片名不能被误杀。
+String? normalizePlayableSourceQuery(String raw, {bool trusted = false}) {
+  var text = raw.trim();
+  if (_isWholeWrapped(text)) {
+    text = text.substring(1, text.length - 1).trim();
+    trusted = true;
+  }
+  if (text.isEmpty || text.contains('\n')) return null;
+
+  // 已被明确标注为片名：只做长度兜底
+  if (trusted) return text.length <= 40 ? text : null;
+
+  // 问号：中文英文都一样，是问句
+  if (RegExp(r'[?？]').hasMatch(text)) return null;
+
+  // 纯外文片名：空格是片名的一部分（The Shawshank Redemption），不按空格拆词
+  if (!_hasCjk.hasMatch(text)) {
+    if (_asciiQuestionMarkers.hasMatch(text.toLowerCase())) return null;
+    return text.length <= 60 ? text : null;
+  }
+
+  if (_cjkQuestionMarkers.hasMatch(text)) return null;
+  if (text.length > 20) return null;
+  if (_metadataWords.contains(text.toLowerCase())) return null;
+
+  // 带空格的自由词：先剥掉元数据词与续集编号，只剩一段才当片名。
+  // 剩多段说明是「车祸失忆 寻找妻子」这类剧情描述，闸门在这里挡下。
+  if (RegExp(r'\s').hasMatch(text)) {
+    final kept = <String>[];
+    final segments = text.split(RegExp(r'\s+')).where((s) => s.isNotEmpty);
+    for (final segment in segments) {
+      if (_numericSegment.hasMatch(segment)) {
+        // 「沙丘 2」→「沙丘2」：中文采集源的续集标题就是这么写的
+        if (kept.isNotEmpty) kept[kept.length - 1] = kept.last + segment;
+        continue;
+      }
+      if (_metadataWords.contains(segment.toLowerCase())) continue;
+      kept.add(segment);
+    }
+    if (kept.length != 1) return null;
+    text = kept.first;
+  }
+
+  return text.length >= 2 ? text : null;
+}
+
+/// 标题类工具的结果里**明确显示什么都没查到**（`{}` / `[]`）
+///
+/// 实测：模型会拿剧情描述或类型词去试查（`douban_lookup(query: "记忆")`、
+/// `query: "失忆 寻找妻子 车祸"`），豆瓣搜索接口回的就是空对象 `{}`。这类
+/// 查询词只是模型的猜测，不能当片名去搜影片源——否则会拿「记忆」搜出一堆
+/// 无关片子。反过来，查到了数据说明模型确实定位到了一部片。
+///
+/// 结果缺失或不是 JSON 时返回 false（无法判断，交回搜索词闸门决定）。
+bool _toolResultEmpty(dynamic result) {
+  if (result is! String) return false;
+  final text = result.trim();
+  if (text.isEmpty) return false;
+  try {
+    final decoded = jsonDecode(text);
+    if (decoded is Map) return decoded.isEmpty;
+    if (decoded is List) return decoded.isEmpty;
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// 提取回复里所有「可播放影片源」的片名候选（去重、按可信度排序、限量）
+///
+/// 与旧版最大的区别是**复数**：模型推荐片单时一条回复往往给出十几个片名，旧实现
+/// 用 `firstMatch` 只取第一个，其余全成了死文本——实测「推荐几部高分科幻片」的
+/// 回复里，客户端只搜了 1 部。
 ///
 /// 优先级（越靠前越像片名）：
-/// 1. 豆瓣/TMDB/站内搜索工具的 `query` 参数——它们本身就是片名；
-/// 2. 回复里的《片名》/「片名」——模型给出推荐时通常会这样写；
-/// 3. `web_search` 的 query——只有足够短、像片名的才采用，避免拿整句
-///   疑问去搜影片源搜出一堆无关结果。
+/// 1. 加粗编号榜单项里的片名（`**1. 星际穿越（2014）｜9.4 分**`）——这是模型
+///    真正按序推荐给用户的片单，实测主推的 5 部全在这里；
+/// 2. 标题类工具（豆瓣/TMDB/站内搜索）的 `query` 参数——模型确实按这些词查过
+///    片，但仍要过闸门（模型也会往这里塞「车祸失忆 寻找妻子」这类剧情描述）；
+/// 3. 回复里的《片名》/「片名」——模型显式标注，全部取用；
+/// 4. `web_search` 的 query——必须过闸门才采用。
 ///
-/// 返回 null 表示提取不到，界面退化为手动「搜影片源」入口。
-String? extractPlayableSourceQuery({
+/// 调用方约定：只提取到 1 个就直接自动搜；多个则渲染成按钮让用户点选。
+List<String> extractPlayableSourceQueries({
   required String reply,
   required List<AiToolCall> toolChain,
 }) {
-  // 1) 标题类工具的 query 参数
+  final titles = <String>[];
+
+  void add(String? raw, {bool trusted = false}) {
+    if (raw == null || titles.length >= maxPlayableSourceQueries) return;
+    final title = normalizePlayableSourceQuery(raw, trusted: trusted);
+    if (title == null || titles.contains(title)) return;
+    titles.add(title);
+  }
+
+  // 1) 加粗编号榜单项：`**1. 星际穿越（2014）｜9.4 分**`
+  //
+  // 为什么单独认这一种写法：实测模型写「高分片单」时会用加粗编号行做主推，
+  // 而《片名》只出现在结尾的补充说明里（那次主推的 5 部一个书名号都没有）。
+  // 只认「编号 + 书名号/竖线」两种结尾信号，避免把 `**说明：**`、
+  // `**硬核烧脑向**（《2012》）` 这类加粗小标题误当片名。
+  for (final match in RegExp(
+    r'\*\*\s*\d+[.、]\s*([^*（(｜|\n]{1,24}?)\s*(?=[（(]\s*\d{4}|[｜|])',
+  ).allMatches(reply)) {
+    // 「机器人总动员 / WALL·E」这类中外双名只取前一半：采集源里中文名匹配率更高
+    add(match.group(1)?.split('/').first);
+  }
+
+  // 2) 标题类工具的 query 参数
   const titleTools = {
     'douban_lookup',
     'tmdb_lookup',
@@ -40,30 +194,28 @@ String? extractPlayableSourceQuery({
     if (!titleTools.contains(call.name)) continue;
     final args = call.args;
     if (args is! Map) continue;
-    final query = args['query']?.toString().trim();
-    if (query != null && query.isNotEmpty) return query;
+    // 查了但明确什么都没查到（`{}` / `[]`）的查询词不算片名
+    if (call.ok == false || _toolResultEmpty(call.result)) continue;
+    add(args['query']?.toString());
   }
 
-  // 2) 书名号里的片名
-  final bookTitle =
-      RegExp(r'《([^》]{1,40})》').firstMatch(reply)?.group(1)?.trim();
-  if (bookTitle != null && bookTitle.isNotEmpty) return bookTitle;
+  // 3) 书名号 / 引号里的片名：模型显式标注为片名，不受闸门限制
+  for (final match in RegExp(r'《([^》]{1,40})》').allMatches(reply)) {
+    add(match.group(1), trusted: true);
+  }
+  for (final match in RegExp(r'「([^」]{1,40})」').allMatches(reply)) {
+    add(match.group(1), trusted: true);
+  }
 
-  final cornerTitle =
-      RegExp(r'「([^」]{1,40})」').firstMatch(reply)?.group(1)?.trim();
-  if (cornerTitle != null && cornerTitle.isNotEmpty) return cornerTitle;
-
-  // 3) 联网搜索词，仅短查询可用
+  // 4) 联网搜索词兜底
   for (final call in toolChain) {
     if (call.name != 'web_search') continue;
     final args = call.args;
     if (args is! Map) continue;
-    final query = args['query']?.toString().trim();
-    if (query != null && query.isNotEmpty && query.length <= 20) {
-      return query;
-    }
+    add(args['query']?.toString());
   }
-  return null;
+
+  return titles;
 }
 
 /// AI 问片：与后端 `/api/ai/chat` 对话的流式聊天页
@@ -870,10 +1022,11 @@ class _AiChatScreenState extends State<AiChatScreen> {
                         isDark: isDark,
                       ),
                     ),
-                  // 影片源直出：回答完成后自动搜同名可播放源，
-                  // 搜不到词时退化为手动「搜影片源」入口
+                  // 影片源直出：回答完成后自动搜同名可播放源；回复里有多部片
+                  // 时列成可点按钮；一个片名都提不到时退化为手动入口
                   if (message.sourceQuery != null ||
-                      message.showManualSourceSearch)
+                      message.showManualSourceSearch ||
+                      message.sourceQueryCandidates.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
                       child: _buildSourceSection(message, isDark),
@@ -886,21 +1039,42 @@ class _AiChatScreenState extends State<AiChatScreen> {
 
   /// 决定本条回复要不要发起影片源搜索（回复流结束后调用一次）
   ///
-  /// 提取到片名就自动搜，把可播放源直接摆到回答下面；提取不到就挂一个
-  /// 手动「搜影片源」入口，由用户决定要不要拿原问题去搜。
+  /// 三种出路：
+  /// - 只提到 1 部片 → 直接自动搜，省一次点击（旧行为）；
+  /// - 提到多部片（推荐片单）→ **不**并发搜一堆，而是列成可点按钮，点哪个搜哪个；
+  /// - 一个片名都没提到 → 挂手动入口，由用户给出片名。
   void _maybeStartSourceSearch(AiChatMessage? target) {
     if (target == null || !mounted || _isStreaming) return;
 
-    final query = extractPlayableSourceQuery(
+    final queries = extractPlayableSourceQueries(
       reply: target.content,
       toolChain: target.toolCalls,
     );
-    if (query != null) {
-      unawaited(_startSourceSearch(target, query));
+
+    // 回复里没有片名时，退一步看用户自己问的话——例如用户写了
+    // 「有《流浪地球》的资源吗」而模型答非所问，仍能把片名捞出来。
+    final userText = _precedingUserText(target);
+    if (queries.isEmpty && userText != null) {
+      queries.addAll(
+        extractPlayableSourceQueries(reply: userText, toolChain: const []),
+      );
+    }
+
+    if (queries.length == 1) {
+      unawaited(_startSourceSearch(target, queries.first));
+      return;
+    }
+    if (queries.length > 1) {
+      // 多部片：搜索是串行的、每轮十几秒，替用户猜「哪 5 部」既慢又容易猜错，
+      // 索性把片名摆出来当按钮——这也是输入成本最低的一条路。
+      setState(() {
+        target.sourceQueryCandidates
+          ..clear()
+          ..addAll(queries);
+      });
       return;
     }
 
-    final userText = _precedingUserText(target);
     if (userText != null && userText.isNotEmpty) {
       setState(() => target.showManualSourceSearch = true);
     }
@@ -1021,6 +1195,8 @@ class _AiChatScreenState extends State<AiChatScreen> {
     for (final sub in subs) {
       await sub.cancel();
     }
+    // 退订之后就没人再改界面了，随后再断开 SSE：每部片都是新建一个
+    // SSESearchService，旧连接收尾与新搜索互不影响。
     await service?.stopSearch();
   }
 
@@ -1050,63 +1226,159 @@ class _AiChatScreenState extends State<AiChatScreen> {
 
   /// 没搜到结果时换一个词重搜
   Future<void> _requerySourceSearch(AiChatMessage message) async {
-    final input = TextEditingController(text: message.sourceQuery ?? '');
     final picked = await showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('换词重搜'),
-        content: TextField(
-          controller: input,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: '输入片名或关键词'),
-          onSubmitted: (value) => Navigator.of(ctx).pop(value),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(input.text),
-            child: const Text('搜索'),
-          ),
-        ],
+      builder: (ctx) => _SourceQueryDialog(
+        title: message.sourceQuery == null ? '输入片名搜源' : '换词重搜',
+        initial: message.sourceQuery ?? '',
       ),
     );
-    input.dispose();
     if (!mounted) return;
     final query = (picked ?? '').trim();
     if (query.isEmpty) return;
     await _startSourceSearch(message, query);
   }
 
-  /// 影片源直出区块：手动入口 / 搜索中 / 卡片列表 / 没搜到+换词重搜
+  /// 影片源直出区块：正文区块（手动入口/搜索中/卡片/换词重搜）+ 多片名按钮组
+  ///
+  /// 按钮组挂在正文**下方**且常驻：搜索出结果时列表会自动滚到底，按钮就在
+  /// 视野里，用户点一下就能换下一部，不必往回翻。只有一个候选时不会走到这里
+  /// （那条路直接自动搜索）。
   Widget _buildSourceSection(AiChatMessage message, bool isDark) {
+    final body = _buildSourceBody(message, isDark);
+    if (message.sourceQueryCandidates.length < 2) {
+      return body ?? const SizedBox.shrink();
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (body != null) ...[
+          body,
+          const SizedBox(height: 6),
+        ],
+        _buildSourceCandidateButtons(message, isDark),
+      ],
+    );
+  }
+
+  /// 回复里提到多部片时的一组可点片名按钮（点哪个就搜哪个）
+  Widget _buildSourceCandidateButtons(AiChatMessage message, bool isDark) {
+    final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
+    final normal = isDark ? const Color(0xFFe8e8e8) : const Color(0xFF2c3e50);
+    final count = message.sourceQueryCandidates.length;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          message.sourceQuery == null
+              ? '🎬 回复里提到 $count 部，点片名搜可播放源'
+              : '🎬 换一部：点片名重新搜可播放源',
+          style: FontUtils.poppins(fontSize: 12, color: muted),
+        ),
+        const SizedBox(height: 4),
+        Wrap(
+          spacing: 6,
+          runSpacing: 2,
+          children: [
+            for (final title in message.sourceQueryCandidates)
+              _buildSourceCandidateButton(
+                message,
+                title,
+                active: message.sourceQuery == title,
+                normalColor: normal,
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 单个片名按钮：[active] 表示当前正在展示/已搜过这一部
+  Widget _buildSourceCandidateButton(
+    AiChatMessage message,
+    String title, {
+    required bool active,
+    required Color normalColor,
+  }) {
+    const accent = Color(0xFF27ae60);
+    return TextButton.icon(
+      // 同一部片再点一次没有新信息，按钮置灰避免重复请求
+      onPressed:
+          active ? null : () => unawaited(_startSourceSearch(message, title)),
+      style: TextButton.styleFrom(
+        foregroundColor: accent,
+        // 置灰态即「当前这一部」：绿底白字
+        disabledForegroundColor: Colors.white,
+        disabledBackgroundColor: accent,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+        side: BorderSide(color: active ? accent : const Color(0x6627ae60)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+        ),
+      ),
+      icon: const Icon(Icons.play_arrow_rounded, size: 15),
+      label: Text(
+        title,
+        style: TextStyle(
+          fontSize: 12.5,
+          color: active ? Colors.white : normalColor,
+        ),
+      ),
+    );
+  }
+
+  /// 影片源区块正文：没发起搜索时的手动入口 / 搜索中 / 卡片列表 / 零结果
+  ///
+  /// 返回 null 表示当前没有东西可展示。
+  Widget? _buildSourceBody(AiChatMessage message, bool isDark) {
     final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
     const accent = Color(0xFF27ae60);
 
-    // 还没发起过搜索：只给手动入口
+    // 还没发起过搜索：只给「输入片名」入口。
+    //
+    // 这里**不再**拿原问题直接去搜：能走到这一步就说明回复和用户问句里都提不出
+    // 片名，多半是「男主出车祸失忆一直在找妻子」这种剧情描述——关键词检索拿它
+    // 搜必然 0 结果（实测 73 个源全空、白等 9 秒）。与其发一个注定失败的请求，
+    // 不如直接请用户给片名。
     if (message.sourceQuery == null) {
-      if (!message.showManualSourceSearch) return const SizedBox.shrink();
-      return TextButton.icon(
-        onPressed: () {
-          final userText = _precedingUserText(message);
-          if (userText == null || userText.isEmpty) return;
-          unawaited(_startSourceSearch(message, userText));
-        },
-        style: TextButton.styleFrom(
-          foregroundColor: accent,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          minimumSize: Size.zero,
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          visualDensity: VisualDensity.compact,
-          side: const BorderSide(color: Color(0x6627ae60)),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+      if (!message.showManualSourceSearch) return null;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.search, size: 14, color: muted),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  '没识别到片名，影片源需要按片名搜',
+                  style: FontUtils.poppins(fontSize: 12, color: muted),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
-        ),
-        icon: const Icon(Icons.search, size: 15),
-        label: const Text('搜影片源', style: TextStyle(fontSize: 12.5)),
+          TextButton.icon(
+            onPressed: () => unawaited(_requerySourceSearch(message)),
+            style: TextButton.styleFrom(
+              foregroundColor: accent,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              visualDensity: VisualDensity.compact,
+            ),
+            icon: const Icon(Icons.edit, size: 15),
+            label: const Text('输入片名搜源', style: TextStyle(fontSize: 12.5)),
+          ),
+        ],
       );
     }
 
@@ -1600,6 +1872,55 @@ class _AiChatScreenState extends State<AiChatScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 「输入片名搜源 / 换词重搜」对话框：输入控制器由对话框自己持有
+///
+/// 不能让调用方在 `showDialog` 返回后立刻 `dispose` 控制器——对话框退场动画
+/// 期间 TextField 仍会重建并 addListener，会抛「A TextEditingController was
+/// used after being disposed」。控制器跟着 State 一起释放就没有这个时间差。
+class _SourceQueryDialog extends StatefulWidget {
+  const _SourceQueryDialog({required this.title, required this.initial});
+
+  final String title;
+  final String initial;
+
+  @override
+  State<_SourceQueryDialog> createState() => _SourceQueryDialogState();
+}
+
+class _SourceQueryDialogState extends State<_SourceQueryDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(hintText: '输入片名或关键词'),
+        onSubmitted: (value) => Navigator.of(context).pop(value),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_controller.text),
+          child: const Text('搜索'),
+        ),
+      ],
     );
   }
 }
