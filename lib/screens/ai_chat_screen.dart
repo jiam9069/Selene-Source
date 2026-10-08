@@ -48,9 +48,17 @@ class _AiChatScreenState extends State<AiChatScreen> {
   /// 工具调用提示文案（如「正在查询豆瓣…」），null 表示当前没有工具在跑
   String? _toolStatus;
 
-  /// 已经完成的工具步骤（如「已查询豆瓣」），让用户看到 AI 确实在干活。
-  /// 只保留最近若干条，避免长时间对话把提示区撑爆。
-  final List<String> _steps = [];
+  /// 正在执行的工具的关键参数（如搜索词），随 [_toolStatus] 一起显示
+  String? _toolStatusKey;
+
+  /// 本次回复的工具链：流式期间渲染在进度行（已完成的步骤），结束时把
+  /// 执行完成的条目固化进最后一条助手消息，随后随 history 回喂服务端，
+  /// 让模型复用已取到的数据、同一会话不再重复调用工具。
+  final List<AiToolCall> _toolChain = [];
+
+  /// 本次回复期间服务端上下文压缩产生的摘要，结束时固化进助手消息
+  ///（服务端重建转录时优先于工具详情，避免上下文重新膨胀）。
+  final List<String> _compressedSummaries = [];
 
   /// 本次回复已经等待的秒数（流式期间每秒刷新）
   int _elapsedSeconds = 0;
@@ -142,7 +150,9 @@ class _AiChatScreenState extends State<AiChatScreen> {
       _messages.add(AiChatMessage(role: AiChatRole.assistant, content: ''));
       _isStreaming = true;
       _toolStatus = null;
-      _steps.clear();
+      _toolStatusKey = null;
+      _toolChain.clear();
+      _compressedSummaries.clear();
       _toolCallCount = 0;
       _elapsedSeconds = 0;
     });
@@ -192,23 +202,62 @@ class _AiChatScreenState extends State<AiChatScreen> {
   void _onStreamEvent(AiStreamEvent event) {
     if (!mounted) return;
 
-    // 工具调用：更新进度提示（不打断正文渲染）
+    // 工具调用：维护本次回复的工具链（不打断正文渲染）
     if (event.isTool) {
       final label = _toolStatusText(event.toolName, event.toolStatus);
       setState(() {
         if (event.isToolRunning) {
+          final key = _toolArgKey(event.toolName, event.toolArgs);
+          _toolChain.add(AiToolCall(
+            name: event.toolName!,
+            args: event.toolArgs,
+            key: key,
+          ));
           _toolStatus = label;
+          _toolStatusKey = key;
         } else {
-          _toolStatus = null;
-          _toolCallCount++;
-          if (label != null && !_steps.contains(label)) {
-            _steps.add(label);
-            // 只保留最近 4 条，超出丢弃最早的
-            if (_steps.length > 4) _steps.removeAt(0);
+          // 完成/失败：落到第一条同名的进行中条目；没有 start 的孤立
+          // 事件（服务端异常）直接补一条已完成记录
+          final failed =
+              event.toolStatus == 'failed' || event.toolOk == false;
+          final status = failed
+              ? 'failed'
+              : (event.toolStatus == 'done' ? 'done' : event.toolStatus);
+          AiToolCall? item;
+          for (final c in _toolChain) {
+            if (!c.isFinished && c.name == event.toolName) {
+              item = c;
+              break;
+            }
           }
+          if (item != null) {
+            item.status = status ?? 'done';
+            item.result = event.toolResult;
+            item.ok = event.toolOk ?? !failed;
+          } else {
+            _toolChain.add(AiToolCall(
+              name: event.toolName!,
+              args: event.toolArgs,
+              key: _toolArgKey(event.toolName, event.toolArgs),
+              status: status ?? 'done',
+              result: event.toolResult,
+              ok: event.toolOk ?? !failed,
+            ));
+          }
+          _toolStatus = null;
+          _toolStatusKey = null;
+          _toolCallCount++;
         }
       });
       _scrollToBottom();
+      return;
+    }
+
+    // 上下文压缩事件：记录摘要（加前缀标记，与网页端固化格式一致），
+    // 流结束时固化进本条助手消息、随 history 回喂
+    final summary = event.compressedSummary;
+    if (summary != null) {
+      _compressedSummaries.add('【较早对话已压缩】\n${summary.trim()}');
       return;
     }
 
@@ -216,6 +265,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
     final text = event.text;
     if (text != null && text.isNotEmpty) {
       _toolStatus = null;
+      _toolStatusKey = null;
       _appendAssistantText(text);
       _scheduleFlush();
     }
@@ -237,6 +287,9 @@ class _AiChatScreenState extends State<AiChatScreen> {
   /// 结束一次流式回复
   void _finishStreaming() {
     if (!mounted) return;
+    // [DONE] 事件与底层流关闭都会走到这里（事件先触发一次、订阅 onDone
+    // 再触发一次），必须幂等，否则工具链会重复固化进同一条消息。
+    if (!_isStreaming) return;
 
     // 收尾时把还在等待的重绘立刻落地，避免丢掉最后一小段正文
     _flushTimer?.cancel();
@@ -247,18 +300,25 @@ class _AiChatScreenState extends State<AiChatScreen> {
     setState(() {
       _isStreaming = false;
       _toolStatus = null;
+      _toolStatusKey = null;
 
       // 助手没有任何内容时给出兜底提示，避免留下空气泡。
       // 分两种情况：AI 有调用工具但没输出正文（服务端问题），
       // 和完全没有响应（网络/超时），提示要能区分才好排查。
       final last = _messages.isEmpty ? null : _messages.last;
-      if (last != null &&
-          last.role == AiChatRole.assistant &&
-          last.content.trim().isEmpty) {
-        last.content = _toolCallCount > 0
-            ? 'AI 已完成 $_toolCallCount 次工具调用，但没有返回文字回答。'
-                '可能是模型服务异常，请再试一次。'
-            : '（未收到回复，请稍后重试）';
+      if (last != null && last.role == AiChatRole.assistant) {
+        // 把本次回复的工具链与压缩摘要固化进消息：之后随 history 回喂，
+        // 服务端（新版工具式模式）据此重建工具转录，模型可直接复用数据。
+        // 只带执行完成的条目，避免把中断的半截调用喂给服务端。
+        last.toolCalls.addAll(_toolChain.where((t) => t.isFinished));
+        last.compressedSummaries.addAll(_compressedSummaries);
+
+        if (last.content.trim().isEmpty) {
+          last.content = _toolCallCount > 0
+              ? 'AI 已完成 $_toolCallCount 次工具调用，但没有返回文字回答。'
+                  '可能是模型服务异常，请再试一次。'
+              : '（未收到回复，请稍后重试）';
+        }
       }
     });
 
@@ -291,10 +351,11 @@ class _AiChatScreenState extends State<AiChatScreen> {
   /// 等。之前只映射了 4 个并不存在的名字，导致所有真实工具都落到 default，
   /// 界面上只剩一句没有信息量的「已完成」。
   ///
-  /// 返回值：进行中返回「正在…」，已完成返回「已…」；[status] 为 done 时
-  /// 返回的是「完成态」文案，用于步骤记录。
+  /// 返回值：进行中返回「正在…」，已完成返回「已…」；[status] 为 done 或
+  /// failed 时返回的是「完成态」文案（失败由步骤行的红 ✕ 标记，不能再当成
+  /// 进行中显示「正在…」）。
   String? _toolStatusText(String? name, String? status) {
-    final isDone = status == 'done';
+    final isDone = status == 'done' || status == 'failed';
 
     // 工具名 -> (进行中, 已完成)
     const table = <String, List<String>>{
@@ -684,36 +745,146 @@ class _AiChatScreenState extends State<AiChatScreen> {
                   color: Colors.white,
                 ),
               )
-            : (message.content.isEmpty
-                // 等待首字时显示跳动的小圆点
-                ? const SizedBox(
-                    width: 54,
-                    height: 20,
-                    child: PulsingDotsIndicator(),
-                  )
-                : (plainText
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (message.content.isEmpty)
+                    // 等待首字时显示跳动的小圆点
+                    const SizedBox(
+                      width: 54,
+                      height: 20,
+                      child: PulsingDotsIndicator(),
+                    )
+                  else if (plainText)
                     // 流式输出中：纯文本，避免每个增量都全量解析 Markdown
-                    ? Text(
-                        message.content,
-                        style: FontUtils.poppins(
-                          fontSize: 14.5,
-                          height: 1.6,
-                          color: isDark
-                              ? const Color(0xFFe8e8e8)
-                              : const Color(0xFF2c3e50),
-                        ),
-                      )
-                    : GptMarkdown(
-                        message.content,
-                        style: FontUtils.poppins(
-                          fontSize: 14.5,
-                          height: 1.6,
-                          color: isDark
-                              ? const Color(0xFFe8e8e8)
-                              : const Color(0xFF2c3e50),
-                        ),
-                      ))),
+                    Text(
+                      message.content,
+                      style: FontUtils.poppins(
+                        fontSize: 14.5,
+                        height: 1.6,
+                        color: isDark
+                            ? const Color(0xFFe8e8e8)
+                            : const Color(0xFF2c3e50),
+                      ),
+                    )
+                  else
+                    GptMarkdown(
+                      message.content,
+                      style: FontUtils.poppins(
+                        fontSize: 14.5,
+                        height: 1.6,
+                        color: isDark
+                            ? const Color(0xFFe8e8e8)
+                            : const Color(0xFF2c3e50),
+                      ),
+                    ),
+                  // 固化后的工具链：本条回复查了哪些数据源，翻看历史时仍在
+                  if (message.toolCalls.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: _buildToolChainList(
+                        message.toolCalls,
+                        isDark: isDark,
+                      ),
+                    ),
+                ],
+              ),
       ),
+    );
+  }
+
+  /// 提取工具调用的关键参数（用于进度提示与步骤行的紧凑展示）
+  ///
+  /// 与网页端 `AIChatPanel.tsx` 的 `TOOL_KEY_EXTRACTORS` 保持一致：
+  /// 搜索类取 `query`，抓网页取 `url`，豆瓣/TMDB 按 id 兜底，TMDB 热榜
+  /// 显示「热榜」。取不到时返回 null（只显示工具名提示）。
+  static String? _toolArgKey(String? name, dynamic args) {
+    if (args is! Map) return null;
+    switch (name) {
+      case 'web_search':
+        final q = args['query']?.toString();
+        return (q == null || q.isEmpty) ? null : q;
+      case 'fetch_page':
+        final url = args['url']?.toString();
+        return (url == null || url.isEmpty) ? null : url;
+      case 'douban_lookup':
+        final q = args['query']?.toString();
+        if (q != null && q.isNotEmpty) return q;
+        final id = args['id'];
+        return id == null ? null : 'ID:$id';
+      case 'tmdb_lookup':
+        if (args['trending'] == true) return '热榜';
+        final q = args['query']?.toString();
+        if (q != null && q.isNotEmpty) return q;
+        final id = args['id'];
+        return id == null ? null : 'ID:$id';
+      default:
+        return null;
+    }
+  }
+
+  /// 工具链列表：每行「状态图标 + 中文标签（+ 关键参数）」
+  ///
+  /// 进度行里只放执行完成的条目（进行中的那条由上方 label 实时显示）；
+  /// 助手气泡里放固化后的完整链条，翻看历史时能看到这条回答查过什么。
+  Widget _buildToolChainList(
+    List<AiToolCall> items, {
+    required bool isDark,
+  }) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (var i = 0; i < items.length; i++)
+          Padding(
+            padding: EdgeInsets.only(top: i == 0 ? 0 : 3),
+            child: _buildToolChainRow(items[i], isDark: isDark),
+          ),
+      ],
+    );
+  }
+
+  /// 工具链单行：状态图标（✓ 绿 / ✕ 红）+ 中文标签（+ 关键参数，超长截断）
+  Widget _buildToolChainRow(AiToolCall item, {required bool isDark}) {
+    final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
+    const accent = Color(0xFF27ae60);
+    const danger = Color(0xFFe74c3c);
+
+    final failed = item.status == 'failed' || item.ok == false;
+    final label = _toolStatusText(item.name, item.status);
+    final key = (item.key == null || item.key!.isEmpty)
+        ? null
+        : (item.key!.length > 60 ? '${item.key!.substring(0, 60)}...' : item.key!);
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 14,
+          height: 14,
+          child: Center(
+            child: Text(
+              failed ? '✕' : '✓',
+              style: FontUtils.poppins(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: failed ? danger : accent,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            key == null
+                ? (label ?? '已完成 ${item.name}')
+                : '${label ?? '已完成 ${item.name}'}  $key',
+            overflow: TextOverflow.ellipsis,
+            style: FontUtils.poppins(fontSize: 11.5, color: muted),
+          ),
+        ),
+      ],
     );
   }
 
@@ -726,8 +897,12 @@ class _AiChatScreenState extends State<AiChatScreen> {
   Widget _buildProgressRow(bool isDark) {
     const accent = Color(0xFF27ae60);
     final muted = isDark ? const Color(0xFF8a8a8a) : const Color(0xFF95a5a6);
-    final current = _toolStatus ??
-        (_steps.isEmpty ? '正在理解你的问题…' : '正在组织回答…');
+    final String? runningLabel = _toolStatus;
+    final current = runningLabel == null
+        ? (_toolChain.isEmpty ? '正在理解你的问题…' : '正在组织回答…')
+        : ((_toolStatusKey ?? '').isEmpty
+            ? runningLabel
+            : '$runningLabel（$_toolStatusKey）');
 
     return Align(
       alignment: Alignment.centerLeft,
@@ -766,12 +941,13 @@ class _AiChatScreenState extends State<AiChatScreen> {
                 ),
               ],
             ),
-            if (_steps.isNotEmpty)
+            // 已完成的工具步骤（进行中的那条由上方 label 实时显示，不重复）
+            if (_toolChain.any((t) => t.isFinished))
               Padding(
                 padding: const EdgeInsets.only(left: 22, top: 4),
-                child: Text(
-                  _steps.map((step) => '✓ $step').join('   '),
-                  style: FontUtils.poppins(fontSize: 11.5, color: muted),
+                child: _buildToolChainList(
+                  _toolChain.where((t) => t.isFinished).toList(),
+                  isDark: isDark,
                 ),
               ),
           ],

@@ -135,6 +135,9 @@ class _JsonResponse extends Stream<List<int>>
   dynamic noSuchMethod(Invocation invocation) => null;
 }
 
+/// 记录所有 POST /api/ai/chat 的请求体（按时间顺序），供「history 回喂」断言
+final List<String> chatRequestBodies = [];
+
 class _FakeRequest implements HttpClientRequest {
   _FakeRequest(this.uri, this._respond);
 
@@ -142,6 +145,7 @@ class _FakeRequest implements HttpClientRequest {
   final Uri uri;
   final Future<HttpClientResponse> Function() _respond;
   final _headers = _FakeHeaders();
+  final List<int> _body = [];
 
   @override
   HttpHeaders get headers => _headers;
@@ -156,7 +160,12 @@ class _FakeRequest implements HttpClientRequest {
 
   @override
   Future<void> addStream(Stream<List<int>> stream) async {
-    await stream.drain<void>();
+    await for (final chunk in stream) {
+      _body.addAll(chunk);
+    }
+    if (uri.path.contains('/api/ai/chat')) {
+      chatRequestBodies.add(utf8.decode(_body, allowMalformed: true));
+    }
   }
 
   @override
@@ -274,6 +283,7 @@ void main() {
   setUp(() {
     // 每个用例开始前重置为「等待创建」状态
     aiResponse = _ControlledResponse();
+    chatRequestBodies.clear();
   });
 
   tearDown(() async {
@@ -423,5 +433,165 @@ void main() {
       contains('1 次工具调用'),
       reason: '只有工具调用没有正文时，提示应说明发生了什么，实际界面文本：\n$text',
     );
+  });
+
+  testWidgets('工具链展示关键参数：进行中显示搜索词，完成后固化在气泡里',
+      (tester) async {
+    await mount(tester);
+    await send(tester, '推荐和流浪地球类似的科幻片');
+
+    // start 事件携带 args：进行中要在界面上看到「正在联网搜索」+ 搜索词
+    aiResponse.emit(
+      'data: {"type":"tool","name":"web_search","status":"start",'
+      '"args":{"query":"流浪地球"}}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+
+    final during = _visibleText(tester);
+    expect(
+      during,
+      contains('正在联网搜索'),
+      reason: '工具执行中应显示具体动作，实际界面文本：\n$during',
+    );
+    expect(
+      during,
+      contains('流浪地球'),
+      reason: 'start 事件的 args 关键参数应实时展示，实际界面文本：\n$during',
+    );
+
+    aiResponse.emit(
+      'data: {"type":"tool","name":"web_search","status":"done",'
+      '"result":"找到 3 部","ok":true}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: {"text":"推荐《流浪地球》"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    final after = _visibleText(tester);
+    expect(
+      after,
+      contains('已联网搜索'),
+      reason: '完成后工具链应固化在气泡里，实际界面文本：\n$after',
+    );
+    expect(
+      after,
+      contains('流浪地球'),
+      reason: '翻看历史时要能看到这条回答查过什么，实际界面文本：\n$after',
+    );
+  });
+
+  testWidgets('工具失败显示红 ✕，且不再被当成进行中', (tester) async {
+    await mount(tester);
+    await send(tester, '查一下流浪地球的评分');
+
+    aiResponse.emit(
+      'data: {"type":"tool","name":"douban_lookup","status":"failed",'
+      '"ok":false}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+
+    // 失败即结束：进度行不能继续显示「正在查询豆瓣」
+    final duringFailed = _visibleText(tester);
+    expect(
+      duringFailed,
+      isNot(contains('正在查询豆瓣')),
+      reason: 'failed 事件后不能还当成进行中，实际界面文本：\n$duringFailed',
+    );
+
+    aiResponse.emit('data: {"text":"抱歉，查询超时了"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    final after = _visibleText(tester);
+    expect(after, contains('✕'), reason: '失败步骤要有红 ✕ 标记：\n$after');
+    expect(
+      after,
+      contains('已查询豆瓣'),
+      reason: '失败也走完成态文案（红 ✕ 表达失败），实际界面文本：\n$after',
+    );
+  });
+
+  testWidgets('回复结束后的工具链与压缩摘要随 history 回喂给服务端',
+      (tester) async {
+    await mount(tester);
+    await send(tester, '上一部高分科幻片');
+
+    aiResponse.emit(
+      'data: {"type":"tool","name":"douban_lookup","status":"start",'
+      '"args":{"query":"流浪地球"}}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit(
+      'data: {"type":"tool","name":"douban_lookup","status":"done",'
+      '"result":"《流浪地球》9.6 分","ok":true}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit(
+      'data: {"type":"context_compressed","summary":"已压缩 6 条较早消息"}\n\n',
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: {"text":"推荐《流浪地球》"}\n\n');
+    await tester.pump(const Duration(milliseconds: 50));
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(
+      chatRequestBodies,
+      hasLength(1),
+      reason: '第一轮应只发出一次请求',
+    );
+
+    // 第二轮请求的 history 必须带上第一轮的工具结果与压缩摘要，
+    // 服务端据此重建转录，模型才能复用数据、不重复调用工具
+    await send(tester, '再来一部类似的');
+    await tester.pump(const Duration(milliseconds: 200));
+
+    expect(
+      chatRequestBodies,
+      hasLength(2),
+      reason: '第二轮应发出第二次请求',
+    );
+    final body =
+        json.decode(chatRequestBodies[1]) as Map<String, dynamic>;
+    final history = (body['history'] as List).cast<Map<String, dynamic>>();
+
+    final assistantTurn = history.firstWhere(
+      (h) => h['role'] == 'assistant',
+      orElse: () => <String, dynamic>{},
+    );
+    expect(assistantTurn, isNotEmpty, reason: 'history 应含助手回合：$history');
+
+    final toolCalls = (assistantTurn['toolCalls'] as List?)?.cast<Map>();
+    expect(toolCalls, isNotNull, reason: '助手回合应回传 toolCalls');
+    expect(toolCalls!.single['name'], 'douban_lookup');
+    expect(toolCalls.single['args'], {'query': '流浪地球'});
+    expect(toolCalls.single['key'], '流浪地球');
+    expect(toolCalls.single['result'], contains('流浪地球'));
+    expect(toolCalls.single['ok'], isTrue);
+
+    final summaries =
+        (assistantTurn['compressedSummaries'] as List?)?.cast<String>();
+    expect(summaries, isNotNull, reason: '助手回合应回传 compressedSummaries');
+    expect(summaries!.single, startsWith('【较早对话已压缩】'));
+    expect(summaries.single, contains('已压缩 6 条较早消息'));
+
+    // 收尾：正常关闭第二轮流式，避免秒表计时器残留在 tearDown 后
+    aiResponse.emit('data: [DONE]\n\n');
+    await aiResponse.finish();
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
   });
 }

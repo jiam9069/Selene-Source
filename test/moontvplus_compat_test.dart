@@ -297,6 +297,58 @@ void main() {
       final event = AiStreamEvent.fromPayload('{"error":"AI功能未启用"}');
       expect(event?.text, 'AI功能未启用');
     });
+
+    test('解析工具调用事件的参数与结果（新版工具式模式）', () {
+      final start = AiStreamEvent.fromPayload(
+        '{"type":"tool","name":"web_search","status":"start",'
+        '"args":{"query":"流浪地球"}}',
+      );
+      expect(start?.isTool, isTrue);
+      expect(start?.toolArgs, {'query': '流浪地球'});
+      expect(start?.isToolRunning, isTrue, reason: 'start 是进行中');
+      expect(start?.toolResult, isNull);
+
+      final done = AiStreamEvent.fromPayload(
+        '{"type":"tool","name":"web_search","status":"done",'
+        '"result":"找到 3 部","ok":true}',
+      );
+      expect(done?.toolResult, '找到 3 部');
+      expect(done?.toolOk, isTrue);
+      expect(done?.isToolRunning, isFalse);
+
+      // 失败事件：不能当成进行中（旧逻辑 status != 'done' 会永远转圈）
+      final failed = AiStreamEvent.fromPayload(
+        '{"type":"tool","name":"douban_lookup","status":"failed","ok":false}',
+      );
+      expect(failed?.isTool, isTrue);
+      expect(failed?.isToolRunning, isFalse, reason: 'failed 是已结束');
+      expect(failed?.toolOk, isFalse);
+
+      // 兼容 done + ok:false（服务端也可能用这种方式表达失败）
+      final notOk = AiStreamEvent.fromPayload(
+        '{"type":"tool","name":"douban_lookup","status":"done","ok":false}',
+      );
+      expect(notOk?.isToolRunning, isFalse);
+      expect(notOk?.toolOk, isFalse);
+    });
+
+    test('解析上下文压缩事件，空摘要忽略', () {
+      final event = AiStreamEvent.fromPayload(
+        '{"type":"context_compressed","summary":"已压缩 6 条较早消息"}',
+      );
+      expect(event?.compressedSummary, '已压缩 6 条较早消息');
+      expect(event?.text, isNull);
+      expect(event?.isTool, isFalse);
+      expect(event?.done, isFalse);
+
+      expect(
+        AiStreamEvent.fromPayload(
+          '{"type":"context_compressed","summary":"  "}',
+        ),
+        isNull,
+        reason: '空白摘要没有信息量，直接忽略',
+      );
+    });
   });
 
   group('AiChatMessage 历史结构', () {
@@ -315,6 +367,52 @@ void main() {
       message.content += '，世界';
 
       expect(message.content, '你好，世界');
+    });
+
+    test('toolCalls 与 compressedSummaries 随 history 回喂', () {
+      final message =
+          AiChatMessage(role: AiChatRole.assistant, content: '推荐《流浪地球》');
+      message.toolCalls.add(AiToolCall(
+        name: 'douban_lookup',
+        args: const {'query': '流浪地球'},
+        key: '流浪地球',
+        status: 'done',
+        result: '《流浪地球》评分 9.6',
+        ok: true,
+      ));
+      message.compressedSummaries.add('【较早对话已压缩】\n摘要正文');
+
+      final historyJson = message.toHistoryJson();
+      expect(historyJson['role'], 'assistant');
+      expect(historyJson['content'], '推荐《流浪地球》');
+      expect(historyJson['toolCalls'], [
+        {
+          'name': 'douban_lookup',
+          'args': {'query': '流浪地球'},
+          'key': '流浪地球',
+          'result': '《流浪地球》评分 9.6',
+          'ok': true,
+        },
+      ]);
+      expect(historyJson['compressedSummaries'], ['【较早对话已压缩】\n摘要正文']);
+    });
+
+    test('空链条不产生多余字段（旧模式服务端只认 role/content）', () {
+      final message = AiChatMessage(role: AiChatRole.assistant, content: '在');
+      expect(message.toolCalls, isEmpty);
+      expect(message.compressedSummaries, isEmpty);
+      expect(
+        message.toHistoryJson().keys.toList(),
+        ['role', 'content'],
+        reason: '没有工具调用时不得携带 toolCalls/compressedSummaries',
+      );
+
+      // null 字段（如无 key 的工具）不写入，避免回喂无意义的空值
+      final bare = AiToolCall(name: 'get_current_time', status: 'done', ok: true);
+      expect(
+        bare.toHistoryJson(),
+        {'name': 'get_current_time', 'ok': true},
+      );
     });
   });
 }
