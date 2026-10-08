@@ -7,7 +7,9 @@ import '../models/live_channel.dart';
 import '../models/live_source.dart';
 import '../models/epg_program.dart';
 import '../models/m3u_content.dart';
+import '../models/web_live_source.dart';
 import 'api_service.dart';
+import 'web_live_service.dart';
 import 'package:http/http.dart' as http;
 import 'package:xml/xml_events.dart';
 import 'package:gbk_codec/gbk_codec.dart';
@@ -70,12 +72,38 @@ class LiveService {
         sources = await LocalModeStorageService.getLiveSources();
       } else {
         sources = await ApiService.getLiveSources();
+        // MoonTVPlus 额外提供「网络直播」，以伪直播源的形式并入列表，
+        // 这样筛选栏与频道列表可以复用同一套 UI。
+        sources = [...sources, ...await _fetchWebLiveSources()];
       }
       _liveSourcesCache = _CacheItem(sources, DateTime.now());
       return sources;
     } catch (e) {
       print('获取直播源失败: $e');
       return _liveSourcesCache?.data ?? [];
+    }
+  }
+
+  /// 把 MoonTVPlus 的网络直播房间转换成直播源条目
+  ///
+  /// 原版 MoonTV 没有这些接口，失败时返回空列表，不影响普通直播源。
+  static Future<List<LiveSource>> _fetchWebLiveSources() async {
+    try {
+      final webLiveSources = await WebLiveService.getSources();
+      return webLiveSources.map((source) {
+        return LiveSource(
+          key: source.liveSourceKey,
+          name: '📡 ${source.name}',
+          url: '',
+          ua: '',
+          epg: '',
+          from: 'weblive',
+          disabled: false,
+        );
+      }).toList();
+    } catch (e) {
+      print('获取网络直播源失败: $e');
+      return <LiveSource>[];
     }
   }
 
@@ -106,6 +134,13 @@ class LiveService {
   static Future<List<LiveChannel>> _fetchAndCacheChannels(
       String sourceKey) async {
     try {
+      // MoonTVPlus 的网络直播：一个房间即一个频道，播放地址需要实时解析
+      if (WebLiveSource.isWebLiveKey(sourceKey)) {
+        final m3uContent = await _fetchWebLiveChannels(sourceKey);
+        _channelsCache[sourceKey] = _CacheItem(m3uContent, DateTime.now());
+        return m3uContent.channels;
+      }
+
       // 从缓存中获取对应的 LiveSource
       final liveSource = _liveSourcesCache?.data.firstWhere(
           (source) => source.key == sourceKey,
@@ -142,6 +177,52 @@ class LiveService {
       print('获取直播频道失败: $e');
       return _channelsCache[sourceKey]?.data.channels ?? [];
     }
+  }
+
+  /// 解析网络直播房间为单个频道
+  ///
+  /// 房间未开播或地址失效时返回空列表，由界面提示「该直播源暂无频道」。
+  static Future<M3uContent> _fetchWebLiveChannels(String sourceKey) async {
+    final platform = WebLiveSource.platformFromKey(sourceKey) ?? '';
+    final roomId = WebLiveSource.roomIdFromKey(sourceKey) ?? '';
+
+    final sourceName = _liveSourcesCache?.data
+            .firstWhere((source) => source.key == sourceKey,
+                orElse: () => LiveSource(
+                      key: sourceKey,
+                      name: '网络直播',
+                      url: '',
+                      ua: '',
+                      epg: '',
+                      from: 'weblive',
+                      disabled: false,
+                    ))
+            .name ??
+        '网络直播';
+
+    if (platform.isEmpty || roomId.isEmpty) {
+      return M3uContent(tvgUrl: '', channels: <LiveChannel>[]);
+    }
+
+    final stream = await WebLiveService.resolveStream(platform, roomId);
+    if (stream == null || stream.url.isEmpty) {
+      return M3uContent(tvgUrl: '', channels: <LiveChannel>[]);
+    }
+
+    return M3uContent(
+      tvgUrl: '',
+      channels: <LiveChannel>[
+        LiveChannel(
+          id: sourceKey,
+          tvgId: '',
+          name: stream.title.isNotEmpty ? stream.title : sourceName,
+          logo: '',
+          group: sourceName,
+          url: stream.url,
+          headers: await WebLiveService.playbackHeaders(),
+        ),
+      ],
+    );
   }
 
   /// 智能解码响应内容，支持 UTF-8、GBK、GB2312 等编码

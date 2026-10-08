@@ -71,9 +71,9 @@ class SearchService {
       // 获取搜索资源列表（使用缓存）
       final allResources = await _getSearchResourcesWithCache();
 
-      // 过滤掉被禁用的资源
+      // 过滤掉被禁用以及无法本地搜索的资源（如 MoonTVPlus 的源脚本）
       final resources =
-          allResources.where((resource) => !resource.disabled).toList();
+          allResources.where((resource) => resource.isSearchable).toList();
 
       if (resources.isEmpty) {
         return [];
@@ -104,9 +104,9 @@ class SearchService {
       // 获取搜索资源列表（使用缓存）
       final allResources = await _getSearchResourcesWithCache();
 
-      // 过滤掉被禁用的资源
+      // 过滤掉被禁用以及无法本地搜索的资源（如 MoonTVPlus 的源脚本）
       final resources =
-          allResources.where((resource) => !resource.disabled).toList();
+          allResources.where((resource) => resource.isSearchable).toList();
 
       if (resources.isEmpty) {
         return [];

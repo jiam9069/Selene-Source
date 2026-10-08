@@ -53,9 +53,9 @@ class SSESearchService {
           ? await LocalModeStorageService.getSearchSources()
           : await ApiService.getSearchResources();
 
-      // 过滤掉被禁用的资源
+      // 过滤掉被禁用以及无法本地搜索的资源（如 MoonTVPlus 的源脚本）
       final resources =
-          allResources.where((resource) => !resource.disabled).toList();
+          allResources.where((resource) => resource.isSearchable).toList();
 
       if (resources.isEmpty) {
         _errorController?.add('没有可用的搜索资源');

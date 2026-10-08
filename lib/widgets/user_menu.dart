@@ -10,6 +10,8 @@ import '../services/page_cache_service.dart';
 import '../services/live_service.dart';
 import '../services/local_search_cache_service.dart';
 import '../services/version_service.dart';
+import '../services/backend_service.dart';
+import '../screens/ai_chat_screen.dart';
 import '../utils/device_utils.dart';
 import '../utils/font_utils.dart';
 import 'update_dialog.dart';
@@ -39,11 +41,24 @@ class _UserMenuState extends State<UserMenu> {
   bool _localSearch = false;
   bool _isLocalMode = false;
 
+  /// 后端是否提供 AI 问片（MoonTVPlus 且后台已启用）
+  bool _aiEnabled = false;
+
   @override
   void initState() {
     super.initState();
     _loadUserInfo();
     _loadVersion();
+    _loadBackendCapabilities();
+  }
+
+  /// 读取后端能力开关，决定是否展示 AI 问片入口
+  Future<void> _loadBackendCapabilities() async {
+    final config = await BackendService.getServerConfig();
+    if (!mounted) return;
+    setState(() {
+      _aiEnabled = config?.aiEnabled ?? false;
+    });
   }
 
   Future<void> _loadVersion() async {
@@ -736,6 +751,27 @@ class _UserMenuState extends State<UserMenu> {
                           ? const Color(0xFF374151)
                           : const Color(0xFFe5e7eb),
                     ),
+                    // AI 问片入口（仅 MoonTVPlus 且后台开启时显示）
+                    if (_aiEnabled) ...[
+                      _buildInputOption(
+                        title: 'AI 问片',
+                        currentValue: '和 AI 聊聊想看什么',
+                        icon: LucideIcons.zap,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => const AiChatScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                      Container(
+                        height: 1,
+                        color: widget.isDarkMode
+                            ? const Color(0xFF374151)
+                            : const Color(0xFFe5e7eb),
+                      ),
+                    ],
                     // 豆瓣数据源选项
                     _buildOptionSelector(
                       title: '豆瓣数据源',

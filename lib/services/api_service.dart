@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'user_data_service.dart';
+import 'backend_service.dart';
 import '../screens/login_screen.dart';
 import '../models/favorite_item.dart';
 import '../models/search_result.dart';
@@ -176,6 +177,30 @@ class ApiService {
     }
   }
 
+  /// 执行一次带认证的请求，并在 access token 过期时自动续期后重试
+  ///
+  /// MoonTVPlus 的 access token 只有 4 小时有效期，过期后 `/api/*` 会返回
+  /// 401（而不是像 MoonTV v100 那样有一个 7 天有效的 Cookie）。
+  /// 这里在收到 401 时先尝试用 Refresh Token 换发新 Cookie，再原样重试一次；
+  /// 续期失败则把 401 交给上层走原来的「重新登录」流程。
+  static Future<http.Response> _sendWithAuthRetry(
+    Future<http.Response> Function(Map<String, String> headers) send, {
+    Map<String, String>? additionalHeaders,
+  }) async {
+    var headers = await _buildHeaders(additionalHeaders: additionalHeaders);
+    var response = await send(headers).timeout(_timeout);
+
+    if (response.statusCode == 401) {
+      final refreshed = await BackendService.refreshAccessToken();
+      if (refreshed) {
+        headers = await _buildHeaders(additionalHeaders: additionalHeaders);
+        response = await send(headers).timeout(_timeout);
+      }
+    }
+
+    return response;
+  }
+
   /// GET请求
   static Future<ApiResponse<T>> get<T>(
     String endpoint, {
@@ -194,14 +219,13 @@ class ApiService {
         url = newUri.toString();
       }
 
-      final requestHeaders = await _buildHeaders(additionalHeaders: headers);
-
-      final response = await http
-          .get(
-            Uri.parse(url),
-            headers: requestHeaders,
-          )
-          .timeout(_timeout);
+      final response = await _sendWithAuthRetry(
+        (requestHeaders) => http.get(
+          Uri.parse(url),
+          headers: requestHeaders,
+        ),
+        additionalHeaders: headers,
+      );
 
       return await _handleResponse(response, fromJson, context);
     } catch (e) {
@@ -219,15 +243,15 @@ class ApiService {
   }) async {
     try {
       final url = await _buildUrl(endpoint);
-      final requestHeaders = await _buildHeaders(additionalHeaders: headers);
 
-      final response = await http
-          .post(
-            Uri.parse(url),
-            headers: requestHeaders,
-            body: body != null ? json.encode(body) : null,
-          )
-          .timeout(_timeout);
+      final response = await _sendWithAuthRetry(
+        (requestHeaders) => http.post(
+          Uri.parse(url),
+          headers: requestHeaders,
+          body: body != null ? json.encode(body) : null,
+        ),
+        additionalHeaders: headers,
+      );
 
       return await _handleResponse(response, fromJson, context);
     } catch (e) {
@@ -245,15 +269,15 @@ class ApiService {
   }) async {
     try {
       final url = await _buildUrl(endpoint);
-      final requestHeaders = await _buildHeaders(additionalHeaders: headers);
 
-      final response = await http
-          .put(
-            Uri.parse(url),
-            headers: requestHeaders,
-            body: body != null ? json.encode(body) : null,
-          )
-          .timeout(_timeout);
+      final response = await _sendWithAuthRetry(
+        (requestHeaders) => http.put(
+          Uri.parse(url),
+          headers: requestHeaders,
+          body: body != null ? json.encode(body) : null,
+        ),
+        additionalHeaders: headers,
+      );
 
       return await _handleResponse(response, fromJson, context);
     } catch (e) {
@@ -270,14 +294,14 @@ class ApiService {
   }) async {
     try {
       final url = await _buildUrl(endpoint);
-      final requestHeaders = await _buildHeaders(additionalHeaders: headers);
 
-      final response = await http
-          .delete(
-            Uri.parse(url),
-            headers: requestHeaders,
-          )
-          .timeout(_timeout);
+      final response = await _sendWithAuthRetry(
+        (requestHeaders) => http.delete(
+          Uri.parse(url),
+          headers: requestHeaders,
+        ),
+        additionalHeaders: headers,
+      );
 
       return await _handleResponse(response, fromJson, context);
     } catch (e) {
@@ -338,13 +362,13 @@ class ApiService {
         return ApiResponse.error('用户未登录');
       }
 
-      final response = await http.get(
-        Uri.parse('$baseUrl/api/favorites'),
-        headers: {
-          'Accept': 'application/json',
-          'Cookie': cookies,
-        },
-      ).timeout(_timeout);
+      final response = await _sendWithAuthRetry(
+        (requestHeaders) => http.get(
+          Uri.parse('$baseUrl/api/favorites'),
+          headers: requestHeaders,
+        ),
+        additionalHeaders: const {'Accept': 'application/json'},
+      );
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = json.decode(response.body);
@@ -539,13 +563,17 @@ class ApiService {
   }
 
   /// 检查网络连接状态
+  ///
+  /// 原实现请求 `/api/health`，但 MoonTV v100 与 MoonTVPlus 都没有这个路由
+  /// （命中中间件后返回 401/404），导致该检查恒为 false。
+  /// 改用两端都提供、且无需登录的 `/api/server-config`。
   static Future<bool> checkConnection() async {
     try {
       final baseUrl = await _getBaseUrl();
       if (baseUrl == null) return false;
 
       final response = await http.get(
-        Uri.parse('$baseUrl/api/health'),
+        Uri.parse('$baseUrl/api/server-config'),
         headers: {'Accept': 'application/json'},
       ).timeout(const Duration(seconds: 5));
 
@@ -553,6 +581,26 @@ class ApiService {
     } catch (e) {
       return false;
     }
+  }
+
+  /// 取得不带结尾斜杠的服务器根地址
+  static Future<String?> getAbsoluteBaseUrl() async {
+    final baseUrl = await _getBaseUrl();
+    if (baseUrl == null || baseUrl.isEmpty) return null;
+    return baseUrl.endsWith('/')
+        ? baseUrl.substring(0, baseUrl.length - 1)
+        : baseUrl;
+  }
+
+  /// 把后端返回的相对地址（如 `/api/emby/image/...`）补全为绝对地址
+  static Future<String> absolutize(String url) async {
+    if (url.isEmpty) return url;
+    if (url.startsWith('http://') || url.startsWith('https://')) return url;
+
+    final base = await getAbsoluteBaseUrl();
+    if (base == null) return url;
+
+    return url.startsWith('/') ? '$base$url' : '$base/$url';
   }
 
   /// 自动登录方法
@@ -612,9 +660,33 @@ class ApiService {
     }
   }
 
+  /// 判断是否为 MoonTVPlus 的 Emby 私人影库源
+  ///
+  /// 单源时为 `emby`，多源时为 `emby_<配置key>`。
+  static bool isEmbySource(String source) =>
+      source == 'emby' || source.startsWith('emby_');
+
+  /// 从 Emby 源标识解析配置 key（`emby_net` → `net`；`emby` → null）
+  static String? embyKeyFromSource(String source) {
+    if (!source.startsWith('emby_')) return null;
+    final key = source.substring('emby_'.length);
+    return key.isEmpty ? null : key;
+  }
+
   /// 获取视频详情
+  ///
+  /// [sourceName] 为已知的源显示名（来自搜索结果），用于补全 Emby 详情
+  /// （`/api/emby/detail` 的响应里不含源名称）。
   static Future<List<SearchResult>> fetchSourceDetail(
-      String source, String id) async {
+    String source,
+    String id, {
+    String? sourceName,
+  }) async {
+    // MoonTVPlus 的 Emby / 私人影库源不走 /api/detail（会返回 400 无效的API来源）
+    if (isEmbySource(source)) {
+      return _fetchEmbyDetail(source, id, sourceName: sourceName);
+    }
+
     try {
       final response = await get<SearchResult>(
         '/api/detail',
@@ -633,6 +705,96 @@ class ApiService {
       }
     } catch (e) {
       print('获取视频详情失败: $e');
+      return [];
+    }
+  }
+
+  /// 获取 Emby 私人影库详情
+  ///
+  /// `/api/emby/detail?id=<itemId>&embyKey=<key>` 返回的结构与
+  /// `/api/detail` 完全不同：
+  /// `{success, item:{id,title,type,overview,poster,year,rating,playUrl},
+  ///   episodes:[{id,title,episode,season,overview,playUrl}]}`
+  /// 这里把它转换成客户端统一的 [SearchResult]。
+  static Future<List<SearchResult>> _fetchEmbyDetail(
+    String source,
+    String id, {
+    String? sourceName,
+  }) async {
+    try {
+      final embyKey = embyKeyFromSource(source);
+      final response = await get<Map<String, dynamic>>(
+        '/api/emby/detail',
+        queryParameters: {
+          'id': id,
+          if (embyKey != null) 'embyKey': embyKey,
+        },
+        fromJson: (data) => data as Map<String, dynamic>,
+      );
+
+      if (!response.success || response.data == null) {
+        print('获取 Emby 详情失败: ${response.message}');
+        return [];
+      }
+
+      final data = response.data!;
+      final item = data['item'] as Map<String, dynamic>?;
+      if (item == null) return [];
+
+      final isMovie = (item['type'] as String?) == 'movie';
+      final rawEpisodes = data['episodes'] as List<dynamic>? ?? [];
+
+      final episodes = <String>[];
+      final episodesTitles = <String>[];
+
+      if (isMovie) {
+        final playUrl = item['playUrl'] as String? ?? '';
+        if (playUrl.isNotEmpty) {
+          episodes.add(await absolutize(playUrl));
+          episodesTitles.add('正片');
+        }
+      } else {
+        for (final entry in rawEpisodes) {
+          if (entry is! Map<String, dynamic>) continue;
+          final playUrl = entry['playUrl'] as String? ?? '';
+          if (playUrl.isEmpty) continue;
+
+          final season = entry['season'];
+          final episode = entry['episode'];
+          final title = entry['title'] as String? ?? '';
+          final label = title.isNotEmpty
+              ? title
+              : (episode != null
+                  ? '第$episode集'
+                  : '第${episodes.length + 1}集');
+          // 多季时带上季号，避免「第1集」重复
+          episodes.add(await absolutize(playUrl));
+          episodesTitles.add(
+            (season != null && season != 1) ? 'S$season $label' : label,
+          );
+        }
+      }
+
+      final poster = item['poster'] as String? ?? '';
+
+      final result = SearchResult(
+        id: item['id']?.toString() ?? id,
+        title: item['title'] as String? ?? '',
+        poster: poster.isEmpty ? '' : await absolutize(poster),
+        episodes: episodes,
+        episodesTitles: episodesTitles,
+        source: source,
+        sourceName: sourceName ??
+            (embyKey != null && embyKey.isNotEmpty ? 'Emby · $embyKey' : 'Emby'),
+        year: item['year']?.toString() ?? '',
+        desc: item['overview'] as String? ?? '',
+        typeName: isMovie ? '电影' : '电视剧',
+        doubanId: 0,
+      );
+
+      return [result];
+    } catch (e) {
+      print('获取 Emby 详情失败: $e');
       return [];
     }
   }

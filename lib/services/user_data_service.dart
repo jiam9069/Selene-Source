@@ -53,6 +53,12 @@ class UserDataService {
     return prefs.getString(_cookiesKey);
   }
 
+  // 仅更新cookies（用于 MoonTVPlus 的 access token 自动续期）
+  static Future<void> saveCookies(String cookies) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_cookiesKey, cookies);
+  }
+
   // 检查是否已登录
   static Future<bool> isLoggedIn() async {
     final cookies = await getCookies();

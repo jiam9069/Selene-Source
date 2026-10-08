@@ -230,12 +230,33 @@ class _PlayerScreenState extends State<PlayerScreen>
         (searchTitle.isNotEmpty) ? searchTitle : videoTitle);
     if (!_isActiveLoad(loadGeneration)) return;
 
-    if (currentSource.isNotEmpty &&
-        currentID.isNotEmpty &&
-        !allSources.any((source) =>
-            source.source == currentSource && source.id == currentID)) {
-      allSources = await fetchSourceDetail(currentSource, currentID);
-      if (!_isActiveLoad(loadGeneration)) return;
+    if (currentSource.isNotEmpty && currentID.isNotEmpty) {
+      final matched = allSources.where((source) =>
+          source.source == currentSource && source.id == currentID);
+
+      // 需要回源拉详情的情况：
+      // 1. 搜索结果里根本没有这条；或
+      // 2. 有这条但没有可播放的剧集 —— MoonTVPlus 的 Emby / 私人影库源
+      //    在搜索结果里 episodes 恒为空，只有详情接口才带播放地址。
+      final needDetail = matched.isEmpty || matched.first.episodes.isEmpty;
+
+      if (needDetail) {
+        final detail = await fetchSourceDetail(
+          currentSource,
+          currentID,
+          sourceName: matched.isNotEmpty ? matched.first.sourceName : null,
+        );
+        if (!_isActiveLoad(loadGeneration)) return;
+
+        if (detail.isNotEmpty) {
+          // 用详情替换搜索结果里的占位条目，避免「有卡片但点不开」
+          allSources = [
+            ...allSources.where((source) =>
+                !(source.source == currentSource && source.id == currentID)),
+            ...detail,
+          ];
+        }
+      }
     }
     if (allSources.isEmpty) {
       showError('未找到匹配结果');
@@ -652,16 +673,64 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   /// 动态更新视频数据源
+  /// 解析出最终可播放的地址（MoonTVPlus 适配）
+  ///
+  /// 两件事：
+  /// 1. 后端可能返回站内相对地址，例如私人影库（OpenList）的
+  ///    `/api/openlist/play?folder=...`，播放器需要绝对地址；
+  /// 2. 源开启「代理模式」时，m3u8 必须经 `/api/proxy/vod/m3u8` 中转，
+  ///    否则部分源会因 Referer / CORS 限制无法播放。
+  ///    该接口会连带重写分片、密钥与嵌套 m3u8，客户端只需替换入口地址。
+  Future<String> _resolveBackendPlayUrl(String url) async {
+    if (url.isEmpty) return url;
+
+    var resolved = url;
+
+    // 1. 补全相对地址
+    if (resolved.startsWith('/')) {
+      final base = await ApiService.getAbsoluteBaseUrl();
+      if (base != null) {
+        resolved = '$base$resolved';
+      }
+    }
+
+    final detail = currentDetail;
+    if (detail == null || !detail.proxyMode) return resolved;
+
+    // 已经是代理地址，避免重复包装
+    if (resolved.contains('/api/proxy/vod/m3u8') ||
+        resolved.contains('/api/proxy-m3u8')) {
+      return resolved;
+    }
+
+    // 只代理 m3u8；mp4 / mkv 等直链无需经过 m3u8 代理
+    final lower = resolved.toLowerCase();
+    final looksLikeM3u8 = lower.contains('.m3u') ||
+        !RegExp(r'\.(mp4|flv|webm|mkv|avi|mov)(\?.*)?$').hasMatch(lower);
+    if (!looksLikeM3u8) return resolved;
+
+    final base = await ApiService.getAbsoluteBaseUrl();
+    if (base == null) return resolved;
+
+    final source = detail.source.isNotEmpty ? detail.source : currentSource;
+    return '$base/api/proxy/vod/m3u8'
+        '?url=${Uri.encodeComponent(resolved)}'
+        '&source=${Uri.encodeComponent(source)}';
+  }
+
   Future<void> updateVideoUrl(String newUrl, {Duration? startAt}) async {
     print("newUrl: $newUrl, startAt: $startAt");
     try {
+      // MoonTVPlus：补全相对地址，并在源开启代理模式时改走服务器中转
+      final playableUrl = await _resolveBackendPlayUrl(newUrl);
+
       // 获取 M3U8 代理 URL
       final m3u8ProxyUrl = await UserDataService.getM3u8ProxyUrl();
 
       // 如果代理 URL 不为空，则将 newUrl encode 后拼接到代理 URL 后面
-      String finalUrl = newUrl;
+      String finalUrl = playableUrl;
       if (m3u8ProxyUrl.isNotEmpty) {
-        final encodedUrl = Uri.encodeComponent(newUrl);
+        final encodedUrl = Uri.encodeComponent(playableUrl);
         finalUrl = '$m3u8ProxyUrl$encodedUrl';
         print("使用 M3U8 代理: $finalUrl");
       }
@@ -2516,13 +2585,15 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   /// 获取视频详情
-  Future<List<SearchResult>> fetchSourceDetail(String source, String id) async {
+  Future<List<SearchResult>> fetchSourceDetail(String source, String id,
+      {String? sourceName}) async {
     // 检查是否启用本地搜索
     final isLocalSearch = await UserDataService.getLocalSearch();
     if (isLocalSearch) {
       return await SearchService.getDetailSync(source, id);
     } else {
-      return await ApiService.fetchSourceDetail(source, id);
+      return await ApiService.fetchSourceDetail(source, id,
+          sourceName: sourceName);
     }
   }
 

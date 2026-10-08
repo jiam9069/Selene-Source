@@ -27,6 +27,14 @@ class SearchResource {
     );
   }
 
+  /// 是否可用于「本地搜索」
+  ///
+  /// MoonTVPlus 的 `/api/search/resources` 会在普通采集源之外追加源脚本条目
+  /// （形如 `{key, name, script: true}`，没有 `api` 字段）。
+  /// 这类源只能由服务端解析，本地搜索拿不到接口地址，必须跳过，
+  /// 否则会拿空 URL 去请求，白白等到超时。
+  bool get isSearchable => !disabled && api.isNotEmpty;
+
   Map<String, dynamic> toJson() {
     return {
       'key': key,

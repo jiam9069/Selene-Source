@@ -609,6 +609,8 @@ class _LivePlayerScreenState extends State<LivePlayerScreen>
         'User-Agent': _currentSource.ua.isNotEmpty
             ? _currentSource.ua
             : 'AptvPlayer/1.4.10',
+        // MoonTVPlus 网络直播的流地址是站内代理，必须带登录 Cookie
+        ..._currentChannel.headers,
       },
       videoTitle: _currentChannel.name,
       onBackPressed:

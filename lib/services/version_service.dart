@@ -4,8 +4,11 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class VersionService {
-  static const String githubRepoUrl = 'https://github.com/MoonTechLab/Selene';
-  static const String githubApiUrl = 'https://api.github.com/repos/MoonTechLab/Selene/releases/latest';
+  // 本仓库为适配 MoonTVPlus 的 Selene 分支，更新检查指向自己的 fork，
+  // 否则会提示升级到上游原版（不含本分支的适配改动）。
+  static const String githubRepoUrl = 'https://github.com/jiam9069/Selene';
+  static const String githubApiUrl =
+      'https://api.github.com/repos/jiam9069/Selene/releases/latest';
   static const String _lastCheckKey = 'last_version_check';
   static const String _dismissedVersionKey = 'dismissed_version';
   

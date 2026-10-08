@@ -8,6 +8,12 @@ class LiveChannel {
   final String url; // 视频源地址
   bool isFavorite; // 是否收藏
 
+  /// 播放该频道时需要附加的请求头
+  ///
+  /// MoonTVPlus 的网络直播走站内代理（`/api/web-live/proxy/*`），
+  /// 该路径需要登录 Cookie，故在此透传给播放器。
+  final Map<String, String> headers;
+
   LiveChannel({
     required this.id,
     required this.tvgId,
@@ -16,6 +22,7 @@ class LiveChannel {
     required this.group,
     required this.url,
     this.isFavorite = false,
+    this.headers = const <String, String>{},
   });
 
   factory LiveChannel.fromJson(Map<String, dynamic> json) {
@@ -50,6 +57,7 @@ class LiveChannel {
     String? group,
     String? url,
     bool? isFavorite,
+    Map<String, String>? headers,
   }) {
     return LiveChannel(
       id: id ?? this.id,
@@ -58,6 +66,7 @@ class LiveChannel {
       logo: logo ?? this.logo,
       group: group ?? this.group,
       url: url ?? this.url,
+      headers: headers ?? this.headers,
       isFavorite: isFavorite ?? this.isFavorite,
     );
   }

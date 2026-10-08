@@ -15,6 +15,10 @@ class SearchResult {
   final String? typeName;
   final int? doubanId;
 
+  /// MoonTVPlus：该源是否启用代理模式。
+  /// 为 true 时 m3u8 需经服务器 `/api/proxy/vod/m3u8` 中转后才能播放。
+  final bool proxyMode;
+
   SearchResult({
     required this.id,
     required this.title,
@@ -28,6 +32,7 @@ class SearchResult {
     this.desc,
     this.typeName,
     this.doubanId,
+    this.proxyMode = false,
   });
 
   /// 从JSON创建SearchResult
@@ -49,6 +54,7 @@ class SearchResult {
       desc: json['desc'],
       typeName: json['type_name'],
       doubanId: json['douban_id'],
+      proxyMode: json['proxyMode'] == true,
     );
   }
 
@@ -67,6 +73,7 @@ class SearchResult {
       'desc': desc,
       'type_name': typeName,
       'douban_id': doubanId,
+      'proxyMode': proxyMode,
     };
   }
 
