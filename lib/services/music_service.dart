@@ -111,6 +111,17 @@ class MusicService {
     return playInfo;
   }
 
+  /// 播放器拉流要带的请求头
+  ///
+  /// 实测（2026-10-09，zt_jp_plus / v226.1.0）：`/api/music/v2/stream`
+  /// **必须带登录 cookie**——middleware 对所有未豁免的 `/api/*` 统一鉴权，
+  /// stream 不在豁免名单里（裸访问 401）。media_kit 拉流同样要带头。
+  static Future<Map<String, String>?> mediaHeaders() async {
+    final cookies = await UserDataService.getCookies();
+    if (cookies == null || cookies.isEmpty) return null;
+    return {'Cookie': cookies};
+  }
+
   /// 把后端返回的相对流地址拼成完整 URL
   ///
   /// 返回 null 表示服务器地址还没配置（理论上登录后不会发生）。

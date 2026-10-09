@@ -113,9 +113,15 @@ class _MusicScreenState extends State<MusicScreen> {
       return;
     }
 
+    // 实测 stream 代理要走 middleware 鉴权，media_kit 拉流必须带 cookie
+    final headers = await MusicService.mediaHeaders();
+
     final player = _player ??= Player();
     try {
-      await player.open(Media(streamUrl));
+      await player.open(Media(
+        streamUrl,
+        httpHeaders: headers ?? const <String, String>{},
+      ));
     } catch (e) {
       debugPrint('[MusicScreen] open failed: $e');
       if (!mounted) return;

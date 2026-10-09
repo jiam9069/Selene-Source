@@ -412,8 +412,9 @@ void main() {
     expect(text, contains('搜一部漫画开始阅读'));
   });
 
-  testWidgets('电子书页：只放行 Legado 结果，OPDS 结果被过滤', (tester) async {
-    // 记录章节目录请求带的定位参数（href / bookId 二选一）
+  testWidgets('电子书页：fan-out 只搜 Legado 源，点书进阅读器', (tester) async {
+    // 记录搜索与章节请求的参数（fan-out 必须带 sourceId；章节定位走 href）
+    final searchRequestParams = <Map<String, String>>[];
     final chapterRequestParams = <Map<String, String>>[];
 
     installRoutes((url) {
@@ -426,6 +427,9 @@ void main() {
         };
       }
       if (url.path.contains('/api/books/search')) {
+        searchRequestParams.add(Map<String, String>.from(
+          url.queryParameters.map((k, v) => MapEntry(k, v)),
+        ));
         return {
           'results': [
             {
@@ -435,12 +439,6 @@ void main() {
               'title': '三体',
               'author': '刘慈欣',
               'detailHref': 'https://legado.example/book/1',
-            },
-            {
-              'id': 'b2',
-              'sourceId': 'opds-main',
-              'sourceName': 'OPDS 主库',
-              'title': '三体（epub）',
             },
           ],
           'failedSources': [],
@@ -486,8 +484,10 @@ void main() {
     final text = visibleText(tester);
     expect(text, contains('三体'));
     expect(text, contains('刘慈欣'));
-    // OPDS 来源的搜索结果不能出现在列表里（读不了，避免死链）
-    expect(text.contains('三体（epub）'), isFalse);
+    // 「全部」是客户端 fan-out：只搜 Legado 源（绝不带空 sourceId 打
+    // 服务端聚合接口——63 源实测 38 秒），OPDS 一次都不会被查询
+    expect(searchRequestParams, isNotEmpty);
+    expect(searchRequestParams.first['sourceId'], 'legado-1');
 
     // 点书进阅读器：自动加载目录并打开第一章
     // （点作者文本而不是书名——书名会先匹配到搜索框里的 EditableText）

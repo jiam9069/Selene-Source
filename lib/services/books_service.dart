@@ -80,6 +80,26 @@ class BooksService {
     return BookListItem.listFromSearchResponse(response.data);
   }
 
+  /// 「全部」= 客户端并发 fan-out 全部 Legado 源
+  ///
+  /// 实测（2026-10-09，zt_jp_plus，63 书源）：服务端聚合搜全部源时被
+  /// OPDS 慢源拖到 **38 秒**，而单源搜索都在 0~3 秒。所以「全部」不能
+  /// 调不带 sourceId 的聚合接口，改为对每个 Legado 源并发单源搜索再
+  /// 合并——快一个量级，还天然滤掉读不了的 OPDS 结果。
+  /// 结果按源在列表里的顺序分组拼接（chip 顺序稳定，方便找）。
+  static Future<List<BookListItem>> searchAllLegado(
+    String query,
+    List<BookSource> legadoSources,
+  ) async {
+    if (legadoSources.isEmpty) return const [];
+    final keyword = query.trim();
+    if (keyword.isEmpty) return const [];
+    final perSource = await Future.wait(
+      legadoSources.map((source) => search(keyword, sourceId: source.id)),
+    );
+    return [for (final batch in perSource) ...batch];
+  }
+
   /// 章节目录（Legado 链路）
   ///
   /// 定位方式有讲究：`bookId` 路径要求书源规则里有 id 模板

@@ -15,11 +15,13 @@ import 'book_reader_screen.dart';
 /// 布局：顶部搜索框 → 书目列表（封面 + 书名 + 作者 + 简介）→
 /// 点书进 [BookReaderScreen]（章节目录 + 正文阅读）。
 ///
-/// 两点说明：
+/// 三点说明：
 /// - 后端是 OPDS + Legado 双引擎，但 OPDS 给的是 epub / pdf 文件，
 ///   客户端没有对应渲染依赖，MVP 只放行 Legado 源的搜索结果；
 /// - 只有 OPDS 源时入口照常出现，页面顶部给出「暂不支持」说明，
-///   不做静默隐藏（否则配了书源的用户会以为客户端坏了）。
+///   不做静默隐藏（否则配了书源的用户会以为客户端坏了）；
+/// - 「全部」用客户端 fan-out（并发搜每个 Legado 源），不调服务端
+///   聚合接口——后者会被 OPDS 慢源拖到 30 秒以上（实测 63 源 38s）。
 class BooksScreen extends StatefulWidget {
   const BooksScreen({super.key});
 
@@ -41,6 +43,9 @@ class _BooksScreenState extends State<BooksScreen> {
   List<BookListItem> _results = const [];
   bool _isSearching = false;
   bool _hasSearched = false;
+
+  /// 当前选中的书源；null = 「全部」（fan-out 全部 Legado 源）
+  BookSource? _selectedSource;
 
   @override
   void initState() {
@@ -74,14 +79,19 @@ class _BooksScreenState extends State<BooksScreen> {
     _searchFocusNode.unfocus();
     if (keyword.isEmpty) return;
     setState(() => _isSearching = true);
-    // 后端会搜所有源（含 OPDS）；这里只放行 Legado 源的结果，
-    // 避免「搜到但读不了」的死链
-    final results = await BooksService.search(keyword);
-    final legadoIds = _legadoSources.map((s) => s.id).toSet();
+    final List<BookListItem> results;
+    if (_selectedSource == null) {
+      // 「全部」：客户端并发搜每个 Legado 源再合并
+      results = await BooksService.searchAllLegado(keyword, _legadoSources);
+    } else {
+      results = await BooksService.search(
+        keyword,
+        sourceId: _selectedSource!.id,
+      );
+    }
     if (!mounted) return;
     setState(() {
-      _results =
-          results.where((item) => legadoIds.contains(item.sourceId)).toList();
+      _results = results;
       _hasSearched = true;
       _isSearching = false;
     });
@@ -105,6 +115,7 @@ class _BooksScreenState extends State<BooksScreen> {
                 children: [
                   _buildHeader(isDark),
                   _buildSearchBar(isDark),
+                  if (_legadoSources.isNotEmpty) _buildSourceChips(isDark),
                   Expanded(child: _buildBody(isDark)),
                 ],
               ),
@@ -232,6 +243,70 @@ class _BooksScreenState extends State<BooksScreen> {
     );
   }
 
+  /// Legado 源 chips：全部 + 各源。名字超长的源（导入的规则源常见）
+  /// 限宽省略，chips 行整体横向滚动。
+  Widget _buildSourceChips(bool isDark) {
+    return SizedBox(
+      height: 34,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        children: [
+          _buildSourceChip(
+            isDark: isDark,
+            label: '全部',
+            selected: _selectedSource == null,
+            onTap: () => setState(() => _selectedSource = null),
+          ),
+          const SizedBox(width: 8),
+          for (var i = 0; i < _legadoSources.length; i++) ...[
+            _buildSourceChip(
+              isDark: isDark,
+              label: _legadoSources[i].name,
+              selected: _selectedSource?.id == _legadoSources[i].id,
+              onTap: () => setState(() => _selectedSource = _legadoSources[i]),
+            ),
+            if (i < _legadoSources.length - 1) const SizedBox(width: 8),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSourceChip({
+    required bool isDark,
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 132),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: selected
+              ? _accentColor
+              : (isDark ? const Color(0xFF1e1e1e) : Colors.white),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        alignment: Alignment.center,
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: FontUtils.poppins(
+            fontSize: 12,
+            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+            color: selected
+                ? Colors.white
+                : (isDark ? const Color(0xFFb0b0b0) : const Color(0xFF7f8c8d)),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildBody(bool isDark) {
     if (_isLoadingSources) {
       return const Center(child: CircularProgressIndicator());
@@ -300,8 +375,9 @@ class _BooksScreenState extends State<BooksScreen> {
       isDark: isDark,
       icon: LucideIcons.bookMarked,
       title: '搜一本书开始阅读',
-      description:
-          '已接入 ${_legadoSources.length} 个 Legado 书源。',
+      description: _selectedSource == null
+          ? '已接入 ${_legadoSources.length} 个 Legado 书源。'
+          : '当前书源：${_selectedSource!.name}',
       showRetry: false,
     );
   }
