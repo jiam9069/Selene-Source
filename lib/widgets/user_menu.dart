@@ -11,9 +11,16 @@ import '../services/live_service.dart';
 import '../services/local_search_cache_service.dart';
 import '../services/version_service.dart';
 import '../services/backend_service.dart';
+import '../models/server_config.dart';
 import '../services/emby_service.dart';
+import '../services/music_service.dart';
+import '../services/manga_service.dart';
+import '../services/books_service.dart';
 import '../screens/ai_chat_screen.dart';
 import '../screens/private_library_screen.dart';
+import '../screens/music_screen.dart';
+import '../screens/manga_screen.dart';
+import '../screens/books_screen.dart';
 import '../utils/device_utils.dart';
 import '../utils/font_utils.dart';
 import 'update_dialog.dart';
@@ -49,6 +56,14 @@ class _UserMenuState extends State<UserMenu> {
   /// 后端是否配置了私人影库（MoonTVPlus 的 Emby 源）
   bool _embyEnabled = false;
 
+  /// 后端三大内容功能是否可用（音乐 / 漫画 / 电子书）
+  ///
+  /// `/api/server-config` 不暴露这三个开关（网页端靠 HTML 注入的
+  /// RUNTIME_CONFIG），客户端只能各自探测实际接口。
+  bool _musicEnabled = false;
+  bool _mangaEnabled = false;
+  bool _booksEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -57,15 +72,28 @@ class _UserMenuState extends State<UserMenu> {
     _loadBackendCapabilities();
   }
 
-  /// 读取后端能力开关，决定是否展示 AI 问片 / 私人影库入口
+  /// 读取后端能力开关，决定是否展示 AI 问片 / 私人影库 / 音乐 / 漫画 /
+  /// 电子书入口
+  ///
+  /// 五个探测并发发起：AI 与 Emby 原有两条，加上三大内容功能各自的
+  /// 可用性探测（音乐探热搜接口、漫画与电子书探源列表）。
   Future<void> _loadBackendCapabilities() async {
-    final config = await BackendService.getServerConfig();
-    // 私人影库要单独探一次，只有后端真的配了 Emby 源才显示入口
-    final embyAvailable = await EmbyService.isAvailable();
+    final results = await Future.wait<dynamic>([
+      BackendService.getServerConfig(),
+      EmbyService.isAvailable(),
+      MusicService.isAvailable(),
+      MangaService.isAvailable(),
+      BooksService.isAvailable(),
+    ]);
     if (!mounted) return;
+    final config = results[0] as ServerConfig?;
+    final embyAvailable = results[1] as bool;
     setState(() {
       _aiEnabled = config?.aiEnabled ?? false;
       _embyEnabled = embyAvailable;
+      _musicEnabled = results[2] as bool;
+      _mangaEnabled = results[3] as bool;
+      _booksEnabled = results[4] as bool;
     });
   }
 
@@ -155,6 +183,12 @@ class _UserMenuState extends State<UserMenu> {
     LiveService.clearAllCache();
     LocalSearchCacheService().clearCache();
     PageCacheService().clearAllCache();
+    // 能力探测缓存也要清：换账号 / 换服务器后，影库与三大内容功能
+    // 的入口可见性必须重新探测（此前 Emby 的缓存从不重置，是个隐患）
+    EmbyService.resetAvailabilityCache();
+    MusicService.resetAvailabilityCache();
+    MangaService.resetSourcesCache();
+    BooksService.resetSourcesCache();
 
     // 只清除密码和cookies，保留服务器地址和用户名
     await UserDataService.clearPasswordAndCookies();
@@ -791,6 +825,71 @@ class _UserMenuState extends State<UserMenu> {
                             MaterialPageRoute(
                               builder: (context) =>
                                   const PrivateLibraryScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                      Container(
+                        height: 1,
+                        color: widget.isDarkMode
+                            ? const Color(0xFF374151)
+                            : const Color(0xFFe5e7eb),
+                      ),
+                    ],
+                    // 音乐视听入口（后端音乐服务可用时显示；
+                    // 文案与 MoonTVPlus 官方 Web UI 的「音乐视听」一致）
+                    if (_musicEnabled) ...[
+                      _buildInputOption(
+                        title: '音乐视听',
+                        currentValue: '搜索并播放在线音乐',
+                        icon: LucideIcons.music,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => const MusicScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                      Container(
+                        height: 1,
+                        color: widget.isDarkMode
+                            ? const Color(0xFF374151)
+                            : const Color(0xFFe5e7eb),
+                      ),
+                    ],
+                    // 漫画展馆入口（后端配置了 Suwayomi 源时显示）
+                    if (_mangaEnabled) ...[
+                      _buildInputOption(
+                        title: '漫画展馆',
+                        currentValue: '在线漫画搜索与阅读',
+                        icon: LucideIcons.bookOpen,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => const MangaScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                      Container(
+                        height: 1,
+                        color: widget.isDarkMode
+                            ? const Color(0xFF374151)
+                            : const Color(0xFFe5e7eb),
+                      ),
+                    ],
+                    // 电子书馆入口（后端配置了书源时显示；
+                    // 纯 OPDS 源时页面里会给出格式说明）
+                    if (_booksEnabled) ...[
+                      _buildInputOption(
+                        title: '电子书馆',
+                        currentValue: '搜书并在线阅读',
+                        icon: LucideIcons.bookMarked,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => const BooksScreen(),
                             ),
                           );
                         },

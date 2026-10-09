@@ -365,6 +365,98 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 因此手机端底栏改为横向滚动容器：放得下时靠 `minWidth` 撑满并保持
 `spaceEvenly` 均分（视觉与改动前一致），放不下时可滚动而不是报错。
 
+### 2.10 新增：音乐视听 / 漫画展馆 / 电子书馆（1.6.13 之后未发版）
+
+MoonTVPlus 的 Web UI 在首页右上角放了三个内容入口：🎵 音乐视听（绿）、
+📖 漫画展馆（青）、📚 电子书馆（琥珀），分别对应 `/music`、`/manga`、
+`/books` 三个页面。客户端此前完全没有对应功能。
+
+#### 入口与可见性探测
+
+入口放在**用户菜单**（与 AI 问片、私人影库同一组），而不是底栏：底栏手机端
+已经 7 项靠横向滚动才不溢出，再加 3 项不可行；首页右上角加图标行则会挤占
+搜索框。三个入口各自探测后端真实可用性才出现：
+
+| 功能 | 探测接口 | 可用判定 |
+|---|---|---|
+| 音乐视听 | `GET /api/music/v2/discovery/hot-search?source=kw` | HTTP 200 且 `success != false` |
+| 漫画展馆 | `GET /api/manga/sources` | 200 且源列表非空 |
+| 电子书馆 | `GET /api/books/sources` | 200 且源列表非空（含纯 OPDS） |
+
+为什么用探测而不是配置开关：`/api/server-config` **不暴露**这三个功能
+的启停字段（网页端靠服务端注入 HTML 的 `RUNTIME_CONFIG.MUSIC_ENABLED /
+SUWAYOMI_ENABLED / BOOKS_ENABLED`），客户端只能摸实际接口。音乐探测的是
+热搜接口而不是配置：上游 LxMusic 服务挂掉时（5xx）入口也隐藏，避免
+「配置过但点进去全是报错」。探测结果进程级缓存，用户菜单每次打开不重复
+打后端；退出登录时全部重置（见下）。
+
+> 顺手修了一个既有隐患：`EmbyService.resetAvailabilityCache` 此前**从未被
+> 调用**——登出 / 换服务器后影库入口的可见性还是旧账号的缓存。现在
+> `_handleLogout` 里会重置 Emby + 音乐 + 漫画 + 电子书四个缓存。
+
+#### 音乐视听（LxMusic 数据源）
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/music/v2/search?q=&source=&type=&page=&limit=` | 搜歌（source ∈ wy/tx/kw/kg/mg） |
+| `POST /api/music/v2/play`（body：`{song, quality, includeUrl}`） | 换稳定流地址 + LRC 歌词（含翻译） |
+| `GET /api/music/v2/history` / `POST` 同路径 | 最近播放的读与写 |
+
+要点：
+
+- `play.url` 是相对路径（`/api/music/v2/stream?…`），**该代理无鉴权**，
+  直接交给 media_kit `Player.open`，不需要带 Cookie。
+- LRC 解析支持一行多时间标（`[00:12.00][01:30.00]同一句`）与
+  `.x/.xx/.xxx` 三种小数精度；歌词面板逐行高亮当前行、原文下叠翻译。
+- 播放器由页面持有（new Player / 离开页面即 dispose），与
+  video_player_widget 的做法一致。
+
+MVP 范围：搜索（song 类型）+ 播放 + 歌词 + 最近播放。歌单
+（`/api/music/v2/playlists`）、发现页（榜单 / 歌单广场）、歌手 / 专辑搜索、
+播放进度续播（`playProgressSec`）留到后续版本。
+
+#### 漫画展馆（Suwayomi 数据源）
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/manga/sources` | 源列表（displayName 优先于 name） |
+| `GET /api/manga/search?q=&sourceId=&page=` | 搜漫画（不传 sourceId 则全源搜） |
+| `GET /api/manga/detail?mangaId=&sourceId=&…` | 详情 + 章节列表（后端会用传入的元数据兜底） |
+| `GET /api/manga/pages?chapterId=` | 章节页列表（返回**相对**代理路径） |
+
+要点：
+
+- 页面图片统一走 `/api/manga/image?path=…`，**这个接口要登录 Cookie**，
+  `CachedNetworkImage` 必须挂 `httpHeaders`，否则全部 401。
+- 阅读器竖向连续滚动、按原图比例渲染，上一章 / 下一章在底栏切换；
+  章节列表默认倒序（最新章在最上），可切换。
+
+MVP 范围：源选择 + 搜索 + 详情 + 阅读。推荐 / 最新
+（`/api/manga/recommend`）、书架（`/api/manga/shelf`）、阅读进度
+（`/api/manga/history`）留到后续版本。
+
+#### 电子书馆（OPDS + Legado 双引擎，MVP 只走 Legado）
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/books/sources` | 源列表（`type` 为 `opds` / `legado`） |
+| `GET /api/books/search?q=&sourceId=` | 搜书（不传 sourceId 则全源搜，会混入 OPDS 结果） |
+| `GET /api/books/read/chapters?sourceId=&bookId=` | Legado 章节目录 |
+| `GET /api/books/read/chapter?sourceId=&href=` | Legado 章节正文（服务端已清洗为纯文本） |
+
+要点：
+
+- **只有 Legado 源能走文本链路**；搜索结果按源过滤，OPDS 结果直接不展示
+  （避免「搜到但读不了」的死链）。纯 OPDS 站点入口照常出现，页面顶部给出
+  格式说明而不是静默隐藏。
+- 正文里残留的 `<img>` / `<br>` 标签在客户端做最后清理；**全角空格
+  （段首缩进）必须保留**，不能当 ASCII 空白 trim 掉。
+- 阅读器字号调节是会话级（进程内静态值），不做持久化。
+
+MVP 范围：搜书 + 章节目录 + 文本阅读（字号调节、章节跳转）。OPDS 的
+epub / pdf（需要引入渲染依赖）、书架（`/api/books/shelf`）、阅读进度
+（`/api/books/history`）、TTS 听书（`/api/books/tts/*`）留到后续版本。
+
 ---
 
 ## 3. 新增与改动的文件
@@ -383,6 +475,18 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 | `lib/models/emby_models.dart` | 私人影库模型（源 / 分类 / 条目）与分页规则 |
 | `lib/services/emby_service.dart` | 私人影库三级接口客户端 |
 | `lib/screens/private_library_screen.dart` | 私人影库浏览页（源 → 分类 → 条目 → 播放） |
+| `lib/models/music_models.dart` | 音乐模型（歌曲 / 播放信息 / LRC 歌词 / 最近播放） |
+| `lib/models/manga_models.dart` | 漫画模型（源 / 搜索项 / 章节 / 页列表） |
+| `lib/models/book_models.dart` | 电子书模型（源 / 书目 / 章节 / 正文） |
+| `lib/services/music_service.dart` | 音乐 v2 客户端（可用性探测 + 搜歌 + 换流地址 + 历史） |
+| `lib/services/manga_service.dart` | 漫画客户端（源 / 搜索 / 详情 / 页列表 + 带Cookie图片头） |
+| `lib/services/books_service.dart` | 电子书客户端（源 / 搜索 / Legado 章节与正文） |
+| `lib/screens/music_screen.dart` | 音乐视听页（搜索 + 播放 + 歌词 + 最近播放） |
+| `lib/screens/manga_screen.dart` | 漫画搜索页（源切换 + 封面网格） |
+| `lib/screens/manga_detail_screen.dart` | 漫画详情页（元数据 + 章节列表） |
+| `lib/screens/manga_reader_screen.dart` | 漫画阅读器（竖向滚动 + 章节切换） |
+| `lib/screens/books_screen.dart` | 电子书搜索页（Legado 过滤 + OPDS 说明） |
+| `lib/screens/book_reader_screen.dart` | 电子书阅读器（章节目录 + 正文 + 字号） |
 | `test/moontvplus_compat_test.dart` | 适配层回归测试（夹具取自真实响应） |
 | `test/ai_chat_stream_test.dart` | AI 问片流式渲染 + 影片源直出回归测试 |
 | `test/ai_reply_fixture_test.dart`、`test/fixtures/ai_reply_*.json` | 真实模型回复回放：多片名按钮与搜索词闸门（夹具取自真实 `/api/ai/chat` 响应） |
@@ -403,7 +507,7 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
 | `lib/services/search_service.dart`、`lib/services/sse_search_service.dart` | 本地搜索过滤改用 `isSearchable` |
 | `lib/screens/player_screen.dart` | 空剧集回源拉详情；播放地址补全与 `proxyMode` 包装 |
 | `lib/screens/live_player_screen.dart` | 透传频道级请求头 |
-| `lib/widgets/user_menu.dart` | AI 问片入口 + 私人影库入口（均按后端能力显示） |
+| `lib/widgets/user_menu.dart` | AI 问片入口 + 私人影库入口 + 音乐 / 漫画 / 电子书入口（均按后端能力探测显示）；登出时重置四个能力缓存 |
 | `lib/screens/home_screen.dart` | 探测 Emby 可用性，决定是否加入「影库」页与底栏项 |
 | `lib/widgets/main_layout.dart` | 新增可选的「影库」底栏项；手机端底栏改为可横向滚动 |
 | `lib/services/version_service.dart` | 更新检查指向本 fork 的 Release |
@@ -428,6 +532,9 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
    - `test/ai_reply_fixture_test.dart`：**真实模型回复**回放（夹具见
      `test/fixtures/`，取自真实实例的 `/api/ai/chat` SSE），锁住
      「主推片单写在加粗编号行里」与「剧情描述问句不发搜索」两处真实行为
+   - `test/music_manga_books_test.dart`：音乐 / 漫画 / 电子书三件套 ——
+     契约形状解析（含脏数据防御）、入口可见性探测的判定边界（5xx / 空源 /
+     纯 OPDS）、三个页面的 smoke（最近播放兜底、源 chips、Legado 结果过滤）
    - `test/emby_private_library_test.dart`：私人影库模型与分页规则
    - `test/private_library_screen_test.dart`：用真实形状响应驱动真实
      `PrivateLibraryScreen`，断言标题 / 源选择 / 分类 / 条目 / 徽标
@@ -479,5 +586,11 @@ MoonTVPlus 的 Web UI 有独立的「私人影库」页面（`/private-library`�
   能返回的源，不做二次分页或按源筛选。
 - 多片名按钮组是**按需搜索**（点哪个搜哪个），不并发发起多次聚合搜索：每轮
   搜索串行十几秒，N 部并发既打满服务端也没人看得过来。
-- 超分（Anime4K）、弹幕、观影室、追番订阅、网盘、书籍、漫画、音乐等
-  MoonTVPlus 专有功能本次未纳入适配范围。
+- 超分（Anime4K）、弹幕、观影室、追番订阅、网盘等 MoonTVPlus 专有功能
+  本次未纳入适配范围。音乐 / 漫画 / 电子书已适配 MVP（见 2.10），但仍有边界：
+  - 电子书只支持 **Legado 文本链路**；OPDS 的 epub / pdf、书架、阅读进度、
+    TTS 听书未做（epub / pdf 需要引入渲染依赖，单独评估）。
+  - 音乐的歌单 / 发现页 / 歌手专辑搜索 / 播放进度续播未做；
+    漫画的书架 / 阅读进度 / 推荐页未做。
+  - 三者的入口可见性靠**运行时探测**（`server-config` 不暴露这些开关），
+    后端把功能关掉或上游数据源失联后，入口会在下次探测后消失。
